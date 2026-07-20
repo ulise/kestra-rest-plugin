@@ -121,7 +121,14 @@ jar {
 
 shadowJar {
     archiveClassifier.set(null)
+    // Let mergeServiceFiles() see every duplicate service file (e.g. Jetty's provider
+    // registrations) instead of dropping them under the default EXCLUDE strategy.
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
     mergeServiceFiles()
+
+    // With INCLUDE, the per-dependency license/notice metadata would otherwise be copied
+    // in verbatim many times over; none of it is needed at runtime.
+    exclude 'META-INF/LICENSE', 'META-INF/LICENSE.*', 'META-INF/NOTICE', 'META-INF/NOTICE.*'
 }
 
 idea {
