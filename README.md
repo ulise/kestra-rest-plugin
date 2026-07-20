@@ -11,6 +11,20 @@ execution with the request data exposed as `{{ trigger.* }}` variables.
 - **Package:** `io.kestra.plugin.restserver`
 - **Requires:** Java 21+, Kestra 1.3.x
 
+## Compatibility
+
+Each plugin release is built and tested against a specific Kestra version. Pick the release matching
+your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jetty (see
+[Javalin 7 instead of 6, and a pinned Jetty](#javalin-7-instead-of-6-and-a-pinned-jetty)).
+
+| Plugin  | Kestra   | Javalin | Jetty    | Java |
+|---------|----------|---------|----------|------|
+| `1.0.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
+
+To build against a different Kestra version, set `kestraVersion` in `gradle.properties` and, if that
+version ships a different Jetty, realign `javalinVersion`/`jettyVersion` as described in the notes below.
+When cutting a new release, add a row here for the versions it was built against.
+
 ## Usage
 
 ```yaml
