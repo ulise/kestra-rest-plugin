@@ -1,0 +1,54 @@
+name: Release Plugin
+
+# kestra-io release workflow, kept dormant on this standalone repo.
+#
+# The `release` job is guarded to the kestra-io repository, so it only runs once the plugin is
+# adopted upstream (where the kestra-io/actions composite action and its bot/signing secrets exist).
+# On this fork a manual run is skipped rather than failing on missing secrets.
+#
+# While developing independently, release locally with the net.researchgate.release plugin:
+#   ./gradlew release
+# which drops the -SNAPSHOT, tags v<version>, and bumps to the next -SNAPSHOT.
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseVersion:
+        description: "Release version (e.g. 1.2.0)"
+        required: true
+      nextVersion:
+        description: "Next version (e.g. 1.3.0-SNAPSHOT)"
+        required: false
+      kestraVersion:
+        description: "Kestra core version (e.g. 1.1.0)"
+        required: false
+      dryRun:
+        description: "If true, simulate the release without pushing or tagging"
+        required: false
+        default: "false"
+      commitsList:
+        description: "(ONLY FOR HOTFIXES) Comma-separated list of SHA1 commits to cherry-pick before creating the release tag. Example: abc123,def456"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    # Activates only under the kestra-io org; on forks the job is skipped (no org secrets).
+    if: ${{ github.repository == 'kestra-io/plugin-rest-server' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Release plugin using reusable action
+        uses: kestra-io/actions/composite/plugin-release@main
+        with:
+          gh-app-id: ${{ secrets.GH_BOT_APP_ID }}
+          gh-app-private-key: ${{ secrets.GH_BOT_PRIVATE_KEY }}
+          releaseVersion: ${{ github.event.inputs.releaseVersion }}
+          kestraVersion: ${{ github.event.inputs.kestraVersion }}
+          nextVersion: ${{ github.event.inputs.nextVersion }}
+          dryRun: ${{ github.event.inputs.dryRun }}
+          commitsList: ${{ github.event.inputs.commitsList }}
