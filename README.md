@@ -145,6 +145,13 @@ curl -i -X POST localhost:8090/api/orders \
 Note that `docker-compose.yml` mounts `build/libs` as the plugins directory, so keep only the shadow jar
 there.
 
+**When bind-mounting the plugins directory into a container, the source must be a path the Docker daemon
+can actually see.** A directory the daemon cannot read (for example under `/tmp` on some setups, or on a
+host the daemon runs remotely from) mounts as *empty* rather than failing. Kestra then silently scans zero
+plugins — you'll see `Registered 0 plugins from 0 groups` in the logs and every flow using the trigger
+fails with an "unknown type" error. Confirm the jar is present inside the container with
+`docker exec <container> ls /app/plugins` before assuming the plugin itself is at fault.
+
 ## Operational notes
 
 **The port is bound on the worker.** A realtime trigger runs on one worker, so the declared port must
