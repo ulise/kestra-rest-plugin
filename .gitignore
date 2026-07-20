@@ -2,6 +2,7 @@
 build/
 out/
 bin/
+allure-results/
 
 .idea/
 *.iml

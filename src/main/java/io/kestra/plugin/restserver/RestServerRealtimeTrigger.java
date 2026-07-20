@@ -47,7 +47,7 @@ import java.util.stream.Collectors;
 @Getter
 @NoArgsConstructor
 @Schema(
-    title = "Expose an HTTP API that triggers one execution per request.",
+    title = "Expose an HTTP API that triggers one execution per request",
     description = """
         Starts an embedded HTTP server for the lifetime of the trigger and registers the declared routes on it,
         in the spirit of Apache Camel's REST DSL. Every matching request creates one realtime execution and is
@@ -115,25 +115,25 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         )
         .collect(Collectors.toMap(HandlerType::name, Function.identity()));
 
-    @Schema(title = "Port the embedded HTTP server listens on.")
+    @Schema(title = "Port the embedded HTTP server listens on")
     @Builder.Default
     private Property<Integer> port = Property.ofValue(8080);
 
     @Schema(
-        title = "Path prefix prepended to every route.",
+        title = "Path prefix prepended to every route",
         description = "Use `/` to register routes at the root."
     )
     @Builder.Default
     private Property<String> basePath = Property.ofValue("/");
 
-    @Schema(title = "Routes served by the embedded server.")
-    @PluginProperty
+    @Schema(title = "Routes served by the embedded server")
+    @PluginProperty(group = "main")
     @NotNull
     @NotEmpty
     private List<RouteDefinition> routes;
 
     @Schema(
-        title = "Host interface to bind to.",
+        title = "Host interface to bind to",
         description = "Defaults to `0.0.0.0`, which accepts connections on every interface."
     )
     @Builder.Default
@@ -399,31 +399,31 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     @Getter
     public static class Output implements io.kestra.core.models.tasks.Output {
 
-        @Schema(title = "HTTP method of the request, e.g. `GET`, `POST`.")
+        @Schema(title = "HTTP method of the request, e.g. `GET`, `POST`")
         private final String method;
 
-        @Schema(title = "Actual request path, e.g. `/api/orders/42`.")
+        @Schema(title = "Actual request path, e.g. `/api/orders/42`")
         private final String path;
 
-        @Schema(title = "Matched route pattern, e.g. `/api/orders/{id}`.")
+        @Schema(title = "Matched route pattern, e.g. `/api/orders/{id}`")
         private final String matchedRoute;
 
-        @Schema(title = "Path parameters extracted from the URL.")
+        @Schema(title = "Path parameters extracted from the URL")
         private final Map<String, String> pathParams;
 
         @Schema(
-            title = "Query parameters from the URL.",
+            title = "Query parameters from the URL",
             description = "Repeated parameters are joined with a comma."
         )
         private final Map<String, String> queryParams;
 
-        @Schema(title = "Request headers.")
+        @Schema(title = "Request headers")
         private final Map<String, String> headers;
 
-        @Schema(title = "Raw request body, decoded as a string.")
+        @Schema(title = "Raw request body, decoded as a string")
         private final String body;
 
-        @Schema(title = "`Content-Type` of the request.")
+        @Schema(title = "`Content-Type` of the request")
         private final String contentType;
     }
 }

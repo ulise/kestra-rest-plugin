@@ -1,7 +1,7 @@
 @PluginSubGroup(
     title = "REST Server",
     description = "Expose declarative HTTP APIs that start Kestra executions.",
-    categories = PluginSubGroup.PluginCategory.INGESTION
+    categories = PluginSubGroup.PluginCategory.INFRASTRUCTURE
 )
 package io.kestra.plugin.restserver;
 
