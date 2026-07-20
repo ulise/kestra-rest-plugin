@@ -1,0 +1,31 @@
+# Single-node Kestra with the plugin mounted, for manual testing.
+#
+#   ./gradlew shadowJar && docker compose up
+#
+# Then open http://localhost:8080, create the flow from examples/order-api.yaml, and call:
+#   curl -i -X POST localhost:8090/api/orders -H 'Content-Type: application/json' -d '{"item":"widget"}'
+services:
+  kestra:
+    image: kestra/kestra:latest
+    command: server local
+    user: root
+    environment:
+      # Local credentials for the UI and API. Kestra 1.x requires basic auth to be configured.
+      KESTRA_CONFIGURATION: |
+        kestra:
+          security:
+            basic-auth:
+              enabled: true
+              username: admin@kestra.io
+              password: Admin1234
+    ports:
+      - "8080:8080"   # Kestra UI and API
+      - "8090:8090"   # the port declared by the trigger in examples/order-api.yaml
+    volumes:
+      - ./build/libs:/app/plugins:ro
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+
+volumes:
+  kestra-data: {}

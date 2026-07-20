@@ -1,0 +1,31 @@
+id: order-api
+namespace: company.myapp
+
+tasks:
+  - id: handle_request
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Method:       {{ trigger.method }}
+      Path:         {{ trigger.path }}
+      MatchedRoute: {{ trigger.matchedRoute }}
+      PathParams:   {{ trigger.pathParams }}
+      QueryParams:  {{ trigger.queryParams }}
+      Headers:      {{ trigger.headers }}
+      Body:         {{ trigger.body }}
+      ContentType:  {{ trigger.contentType }}
+
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    routes:
+      - method: GET
+        path: /orders/{id}
+        produces: application/json
+      - method: POST
+        path: /orders
+        consumes: application/json
+        produces: application/json
+      - method: DELETE
+        path: /orders/{id}

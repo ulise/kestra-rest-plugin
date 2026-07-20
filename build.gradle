@@ -1,0 +1,132 @@
+plugins {
+    id 'java-library'
+    id 'idea'
+    id 'jacoco'
+    id 'com.gradleup.shadow' version '9.5.1'
+    id 'com.adarshr.test-logger' version '4.0.0'
+}
+
+group = 'io.kestra.plugin'
+description = 'Embedded REST server realtime trigger for Kestra'
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    if (version.toString().endsWith('-SNAPSHOT')) {
+        maven { url = 'https://central.sonatype.com/repository/maven-snapshots/' }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    // Kestra's annotation processor reads parameter names to build the plugin schema.
+    options.compilerArgs.add('-parameters')
+    options.release = 21
+}
+
+// Kestra's platform BOM pins Jetty with a `strictly` constraint, for the benefit of plugins that embed
+// it. Kestra core itself has no Jetty dependency, while Javalin 7 is compiled against a newer Jetty, and
+// mixing the two throws NoSuchMethodError inside Jetty's own modules. So Javalin's Jetty wins here.
+configurations.configureEach {
+    resolutionStrategy.eachDependency { details ->
+        if (details.requested.group.startsWith('org.eclipse.jetty')) {
+            details.useVersion jettyVersion
+            details.because "aligned with Javalin $javalinVersion, overriding the Kestra platform BOM"
+        }
+    }
+}
+
+dependencies {
+    // Kestra platform BOM aligns Lombok, Jackson, Reactor, Micronaut, JUnit, ... with the versions
+    // the target Kestra instance runs.
+    annotationProcessor platform("io.kestra:platform:$kestraVersion")
+    implementation platform("io.kestra:platform:$kestraVersion")
+
+    annotationProcessor 'org.projectlombok:lombok'
+    compileOnly 'org.projectlombok:lombok'
+
+    // Provided by the Kestra runtime — must not be bundled into the shadow jar.
+    annotationProcessor group: 'io.kestra', name: 'processor', version: kestraVersion
+    compileOnly group: 'io.kestra', name: 'core', version: kestraVersion
+
+    // The embedded HTTP server. Bundled, since Kestra does not provide it.
+    implementation "io.javalin:javalin:$javalinVersion"
+}
+
+/**********************************************************************************************************************\
+ * Test
+ **********************************************************************************************************************/
+test {
+    useJUnitPlatform()
+    finalizedBy jacocoTestReport
+}
+
+testlogger {
+    theme = 'mocha-parallel'
+    showExceptions = true
+    showFullStackTraces = true
+    showStandardStreams = true
+    showPassedStandardStreams = false
+    showSkippedStandardStreams = true
+}
+
+dependencies {
+    testAnnotationProcessor platform("io.kestra:platform:$kestraVersion")
+    testImplementation platform("io.kestra:platform:$kestraVersion")
+
+    testAnnotationProcessor 'org.projectlombok:lombok'
+    testCompileOnly 'org.projectlombok:lombok'
+
+    testAnnotationProcessor 'io.micronaut:micronaut-inject-java'
+    testAnnotationProcessor 'io.micronaut.validation:micronaut-validation-processor'
+    testImplementation 'io.micronaut.test:micronaut-test-junit5'
+    testImplementation 'io.micronaut:micronaut-jackson-databind'
+
+    // A minimal in-memory Kestra runtime, so tests can actually execute flows.
+    testAnnotationProcessor group: 'io.kestra', name: 'processor', version: kestraVersion
+    testImplementation group: 'io.kestra', name: 'core', version: kestraVersion
+    testImplementation group: 'io.kestra', name: 'tests', version: kestraVersion
+    testImplementation group: 'io.kestra', name: 'repository-memory', version: kestraVersion
+    testImplementation group: 'io.kestra', name: 'runner-memory', version: kestraVersion
+    testImplementation group: 'io.kestra', name: 'storage-local', version: kestraVersion
+
+    testImplementation 'org.junit.jupiter:junit-jupiter-engine'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.hamcrest:hamcrest'
+    testImplementation 'org.hamcrest:hamcrest-library'
+    testImplementation 'org.awaitility:awaitility'
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required.set(true)
+    }
+}
+
+/**********************************************************************************************************************\
+ * Package
+ **********************************************************************************************************************/
+jar {
+    manifest {
+        attributes(
+            'X-Kestra-Name': project.name,
+            'X-Kestra-Title': 'REST Server',
+            'X-Kestra-Group': project.group + '.restserver',
+            'X-Kestra-Description': project.description,
+            'X-Kestra-Version': project.version
+        )
+    }
+}
+
+shadowJar {
+    archiveClassifier.set(null)
+    mergeServiceFiles()
+}
+
+idea {
+    module {
+        downloadJavadoc = true
+        downloadSources = true
+    }
+}
