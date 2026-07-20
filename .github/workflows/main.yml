@@ -1,11 +1,23 @@
-name: Build
+name: Main
+
+# Self-contained CI, styled after the kestra-io plugin-template's main.yml but without the
+# kestra-io/actions reusable workflow, so it stays green on this standalone repo (no org secrets).
+# When the plugin is adopted upstream, replace this file with the template's main.yml + release.yml,
+# which call kestra-io/actions/.github/workflows/plugins.yml and .../composite/plugin-release@main.
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      skip-test:
+        description: 'Skip tests'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -15,8 +27,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
-    name: Build and test
+  check:
+    name: Build, test and lint
     runs-on: ubuntu-latest
 
     steps:
@@ -31,8 +43,15 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Build and test
+      # `build` runs the tests and the kestra-io plugin-doc-lint checks.
+      - name: Build, test and lint
+        if: ${{ !inputs.skip-test }}
         run: ./gradlew build --no-daemon
+
+      # Skip-test path: compile and lint only, no tests.
+      - name: Build and lint (tests skipped)
+        if: ${{ inputs.skip-test }}
+        run: ./gradlew classes lintPluginDocs --no-daemon
 
       - name: Build plugin jar
         run: ./gradlew shadowJar --no-daemon

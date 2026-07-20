@@ -1,6 +1,6 @@
 # Kestra Plugin: REST Server Realtime Trigger
 
-[![Build](https://github.com/ulise/kestra-rest-plugin/actions/workflows/build.yml/badge.svg)](https://github.com/ulise/kestra-rest-plugin/actions/workflows/build.yml)
+[![Main](https://github.com/ulise/kestra-rest-plugin/actions/workflows/main.yml/badge.svg)](https://github.com/ulise/kestra-rest-plugin/actions/workflows/main.yml)
 [![Release](https://img.shields.io/github/v/release/ulise/kestra-rest-plugin?sort=semver)](https://github.com/ulise/kestra-rest-plugin/releases/latest)
 
 A Kestra plugin that embeds a declarative HTTP server as a **realtime trigger**. Routes are defined in
