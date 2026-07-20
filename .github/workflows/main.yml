@@ -60,7 +60,9 @@ jobs:
       # those come from the runtime, and bundling them breaks plugin loading.
       - name: Verify jar packaging
         run: |
-          jar=$(ls build/libs/plugin-rest-server-*.jar)
+          # Select the shadow jar specifically: the maven-publish plugin also emits
+          # -sources.jar / -javadoc.jar, which must be excluded from this check.
+          jar=$(ls build/libs/plugin-rest-server-*.jar | grep -vE '(sources|javadoc)\.jar$' | head -1)
           echo "Checking $jar"
           if unzip -l "$jar" | grep -q 'io/kestra/core/'; then
             echo "::error::Kestra core classes are bundled in the plugin jar"
