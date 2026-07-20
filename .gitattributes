@@ -1,0 +1,9 @@
+# Normalize to LF in the repository, and check out with the ending each file needs.
+* text=auto eol=lf
+
+# The Gradle wrapper batch script is only run by cmd.exe, which wants CRLF.
+*.bat text eol=crlf
+
+*.jar binary
+*.png binary
+*.svg text
