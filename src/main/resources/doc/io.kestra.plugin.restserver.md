@@ -37,7 +37,11 @@ outputs:
 
 Set `apiKey` (from a secret) to require an API key in the `authHeader` header (default `X-Api-Key`,
 looked up case-insensitively). Missing or wrong keys are rejected with `401` before any route matching.
-Leaving `apiKey` empty or unset disables the check.
+Leaving both `apiKey` and `apiKeys` empty or unset disables the check.
+
+To front several partners that each use their own key, list them in `apiKeys` (combined with `apiKey`); a
+request passes if its key matches any of them. The matched key is still forwarded to the flow in
+`{{ trigger.headers }}`, so the flow can map the caller to their data.
 
 ## Example
 

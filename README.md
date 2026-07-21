@@ -82,6 +82,7 @@ Content-Type: application/json
 | `responseOutput` | `String`      | `response`  | Flow output whose `{status, body, headers}` shapes the response.  |
 | `authHeader`     | `String`      | `X-Api-Key` | Header carrying the API key (case-insensitive lookup).            |
 | `apiKey`         | `String`      | _(none)_    | Expected API key; when set, requests without it get `401`. Empty/null disables auth. Store it as a secret. |
+| `apiKeys`        | `List<String>`| _(none)_    | Accepted keys for multiple callers; a request passes if its key matches `apiKey` or any entry. The matched key still reaches the flow. Store as secrets. |
 
 Each route takes `method` (required), `path` (required), `consumes`, `produces`, and an optional `wait`
 that overrides the trigger-level default. All of these are Kestra properties, so they accept Pebble
@@ -145,8 +146,32 @@ runner; on distributed executor backends its behaviour needs separate verificati
 Set `apiKey` (from a secret) to require an API key. Requests missing it, or presenting the wrong value in
 the `authHeader` header (default `X-Api-Key`), are rejected with `401` before any route matching or
 execution. The header lookup is **case-insensitive**, so a gateway that normalises header casing cannot
-cause a fail-open. Leaving `apiKey` empty or unset disables the check. This is a single shared key; for
-per-caller auth or TLS, keep the port behind a reverse proxy.
+cause a fail-open. Leaving both `apiKey` and `apiKeys` empty or unset disables the check. For per-caller
+auth beyond a shared key, or TLS, keep the port behind a reverse proxy.
+
+**Multiple callers.** To front several partners that each present their own key, list the accepted keys in
+`apiKeys` (combined with `apiKey`); a request passes if its key matches any of them. The **matched key is
+still forwarded to the flow** in `{{ trigger.headers }}`, so the flow can map the caller to their data —
+the plugin only gates on membership, it never strips the key:
+
+```yaml
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    apiKeys:
+      - "{{ secret('PARTNER_A_KEY') }}"
+      - "{{ secret('PARTNER_B_KEY') }}"
+    routes:
+      - method: GET
+        path: /orders/{id}
+        produces: application/json
+```
+
+If you prefer the flow to own auth entirely (arbitrary key-to-partner logic, custom `401` bodies), leave
+both `apiKey` and `apiKeys` unset and validate `{{ trigger.headers['X-Api-Key'] }}` in the flow, returning
+a flow-controlled `401` via `responseOutput` (requires `wait: true`).
 
 ## Build
 
