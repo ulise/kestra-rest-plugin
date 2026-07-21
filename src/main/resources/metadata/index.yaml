@@ -2,7 +2,7 @@ group: io.kestra.plugin.restserver
 name: "restserver"
 title: "REST Server"
 description: "Expose declarative HTTP APIs that start Kestra executions."
-body: "Declare routes (method, path, consumes, produces) on an embedded HTTP server, in the spirit of Apache Camel's REST DSL. Each matching request starts one realtime execution and is answered immediately with 202 Accepted and the execution id, with the request method, path, params, headers, and body exposed as trigger variables."
+body: "Declare routes (method, path, consumes, produces) on an embedded HTTP server, in the spirit of Apache Camel's REST DSL. Each matching request starts one realtime execution, with the request method, path, params, headers, and body exposed as trigger variables. By default the request is answered immediately with 202 Accepted and the execution id; enable wait mode to block until the execution completes and let the flow control the status, body, and headers. An optional API key guards the endpoints."
 videos: []
 createdBy: "USchulzeEyssingBK"
 managedBy: "USchulzeEyssingBK"
