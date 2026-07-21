@@ -3,11 +3,15 @@ package io.kestra.plugin.restserver;
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.flows.State;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.Trigger;
+import io.kestra.core.queues.QueueFactoryInterface;
+import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
+import jakarta.inject.Named;
 import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
@@ -23,7 +27,9 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -45,6 +51,10 @@ class RestServerRealtimeTriggerTest {
 
     @Inject
     private RunContextFactory runContextFactory;
+
+    @Inject
+    @Named(QueueFactoryInterface.EXECUTION_NAMED)
+    private QueueInterface<Execution> executionQueue;
 
     @Test
     void postFiresExecutionWithBody() throws Exception {
@@ -207,6 +217,183 @@ class RestServerRealtimeTriggerTest {
         assertThat(RestServerRealtimeTrigger.normalizePath("/api", "/orders"), is("/api/orders"));
         assertThat(RestServerRealtimeTrigger.normalizePath("/api/", "orders"), is("/api/orders"));
         assertThat(RestServerRealtimeTrigger.normalizePath("/api", "orders/{id}"), is("/api/orders/{id}"));
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // #3 API-key authentication
+    // -------------------------------------------------------------------------------------------------------------
+
+    @Test
+    void authorizedIsCaseInsensitiveOnHeaderNameAndFailsClosed() {
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "s3cret"), "X-Api-Key", "s3cret"), is(true));
+        // Header names are case-insensitive: a normalised "x-api-key" must still match.
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("x-api-key", "s3cret"), "X-Api-Key", "s3cret"), is(true));
+        // Wrong value is rejected.
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "nope"), "X-Api-Key", "s3cret"), is(false));
+        // Missing header fails closed, never "no key required".
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of(), "X-Api-Key", "s3cret"), is(false));
+    }
+
+    @Test
+    void apiKeyGuardsRequestsBeforeAnyExecution() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .apiKey(Property.ofValue("s3cret"))
+            .routes(List.of(route("GET", "/orders", null, null)))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            assertThat(send(request(port, "/api/orders").GET()).statusCode(), is(401));
+            assertThat(send(request(port, "/api/orders").header("X-Api-Key", "nope").GET()).statusCode(), is(401));
+            // Neither rejected request started an execution.
+            assertThat(executions, is(empty()));
+
+            // Correct key, supplied under a lower-cased header name, is accepted.
+            assertThat(send(request(port, "/api/orders").header("x-api-key", "s3cret").GET()).statusCode(), is(202));
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+        });
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // #2 Flow-controlled response mapping
+    // -------------------------------------------------------------------------------------------------------------
+
+    @Test
+    void mapResponseUsesFlowOutputForStatusBodyAndHeaders() throws Exception {
+        Execution execution = Execution.builder()
+            .id("e1")
+            .state(new State(State.Type.SUCCESS))
+            .outputs(Map.of("response", Map.of(
+                "status", 404,
+                "body", "{\"status\":\"NOT_FOUND\"}",
+                "headers", Map.of("X-Trace-Id", "t1")
+            )))
+            .build();
+
+        RestServerRealtimeTrigger.ResponseSpec spec =
+            RestServerRealtimeTrigger.mapResponse(execution, "response", "application/json");
+
+        // Non-2xx status with a body that survives verbatim — the crux of issue #2.
+        assertThat(spec.status(), is(404));
+        assertThat(spec.body(), is("{\"status\":\"NOT_FOUND\"}"));
+        assertThat(spec.headers(), hasEntry("X-Trace-Id", "t1"));
+    }
+
+    @Test
+    void mapResponseSerialisesObjectBodyAndDefaultsStatusByState() throws Exception {
+        // Object body is JSON-serialised; missing status defaults to 200 on success.
+        Execution success = Execution.builder()
+            .id("e2")
+            .state(new State(State.Type.SUCCESS))
+            .outputs(Map.of("response", Map.of("body", Map.of("hello", "world"))))
+            .build();
+        RestServerRealtimeTrigger.ResponseSpec successSpec =
+            RestServerRealtimeTrigger.mapResponse(success, "response", "application/json");
+        assertThat(successSpec.status(), is(200));
+        assertThat(successSpec.body(), containsString("\"hello\":\"world\""));
+
+        // No response output on a failed execution defaults to 500.
+        Execution failed = Execution.builder()
+            .id("e3")
+            .state(new State(State.Type.FAILED))
+            .outputs(Map.of())
+            .build();
+        RestServerRealtimeTrigger.ResponseSpec failedSpec =
+            RestServerRealtimeTrigger.mapResponse(failed, "response", "application/json");
+        assertThat(failedSpec.status(), is(500));
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // #1 Synchronous wait mode
+    // -------------------------------------------------------------------------------------------------------------
+
+    @Test
+    void awaiterCompletesOnlyOnTerminalMatchingExecution() throws Exception {
+        RestServerRealtimeTrigger.ExecutionAwaiter awaiter = new RestServerRealtimeTrigger.ExecutionAwaiter();
+        CompletableFuture<Execution> pending = awaiter.register("exec-1");
+
+        // A non-terminal state for the same id must not complete the request.
+        awaiter.onExecution(Execution.builder().id("exec-1").state(new State(State.Type.RUNNING)).build());
+        assertThat(pending.isDone(), is(false));
+
+        // A terminal state for a different id must not complete it either.
+        awaiter.onExecution(Execution.builder().id("other").state(new State(State.Type.SUCCESS)).build());
+        assertThat(pending.isDone(), is(false));
+
+        // Terminal + matching id completes with that execution.
+        awaiter.onExecution(Execution.builder().id("exec-1").state(new State(State.Type.SUCCESS)).build());
+        assertThat(pending.isDone(), is(true));
+        assertThat(pending.get().getId(), is("exec-1"));
+    }
+
+    @Test
+    void syncModeReturnsFlowControlledResponse() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .wait(Property.ofValue(true))
+            .waitTimeout(Property.ofValue(Duration.ofSeconds(15)))
+            .routes(List.of(route("GET", "/orders/{id}", null, null)))
+            .build();
+
+        List<Execution> executions = new CopyOnWriteArrayList<>();
+        Disposable subscription = subscribe(trigger, executions);
+
+        try {
+            awaitListening(port);
+
+            // The request blocks until we push a terminal execution, so it runs off the test thread.
+            CompletableFuture<HttpResponse<String>> pending = CompletableFuture.supplyAsync(() ->
+                send(request(port, "/api/orders/42").timeout(Duration.ofSeconds(20)).GET()));
+
+            // Wait until the trigger has started (and registered) the execution, then complete it out of band.
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution terminal = executions.getFirst()
+                .withState(State.Type.SUCCESS)
+                .withOutputs(Map.of("response", Map.of(
+                    "status", 404,
+                    "body", "{\"status\":\"NOT_FOUND\"}",
+                    "headers", Map.of("X-Trace-Id", "abc")
+                )));
+            executionQueue.emit(terminal);
+
+            HttpResponse<String> response = pending.get(20, TimeUnit.SECONDS);
+            assertThat(response.statusCode(), is(404));
+            assertThat(response.body(), is("{\"status\":\"NOT_FOUND\"}"));
+            assertThat(response.headers().firstValue("X-Trace-Id").orElse(""), is("abc"));
+        } finally {
+            trigger.stop();
+            subscription.dispose();
+        }
+    }
+
+    @Test
+    void syncModeTimesOutWhenExecutionNeverCompletes() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .wait(Property.ofValue(true))
+            .waitTimeout(Property.ofValue(Duration.ofSeconds(1)))
+            .routes(List.of(route("GET", "/orders/{id}", null, null)))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/orders/42").timeout(Duration.ofSeconds(10)).GET());
+            assertThat(response.statusCode(), is(504));
+            assertThat(response.body(), containsString("timeout"));
+            // The execution was still started; only the response gave up waiting.
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+        });
     }
 
     // -----------------------------------------------------------------------------------------------------------------
