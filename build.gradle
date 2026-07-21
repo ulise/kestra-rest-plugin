@@ -158,7 +158,9 @@ jacocoTestReport {
  **********************************************************************************************************************/
 mavenPublishing {
     publishToMavenCentral(true)
-    signAllPublications()
+    // Not signed: the gh-pages static repo needs no signatures, and Central (which would require them) is
+    // blocked for the io.kestra.plugin namespace. Signing a release with no key fails the publish, so a
+    // future Central move must re-add signAllPublications() together with a signing key.
     coordinates("${project.group}", "${project.name}", "${project.version}")
     pom {
         name = "${project.name}"
