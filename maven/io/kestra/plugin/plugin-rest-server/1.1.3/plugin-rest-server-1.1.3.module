@@ -1,0 +1,121 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.kestra.plugin",
+    "module": "plugin-rest-server",
+    "version": "1.1.3",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.6.1"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 21,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "plugin-rest-server-1.1.3.jar",
+          "url": "plugin-rest-server-1.1.3.jar",
+          "size": 7189281,
+          "sha512": "935441bc31d969b1423227f85a7915535b44bbfd3731f99e45822eb1ccc11d9a970d63b11d87c104c5362b79948bc8ac46145846a1253f19d10fdf617aa7b013",
+          "sha256": "917c4fbe04293110ad7a1d5bc61054ec795f7114c7252c95f92baa5179761252",
+          "sha1": "f55b70e384bbede74fcb27adfc60d20c2ce64344",
+          "md5": "322b25a1e4a73a3a3fddf2c4c7d78946"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 21,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "io.kestra",
+          "module": "platform",
+          "version": {
+            "strictly": "1.3.28",
+            "requires": "1.3.28"
+          },
+          "attributes": {
+            "org.gradle.category": "enforced-platform"
+          }
+        },
+        {
+          "group": "io.javalin",
+          "module": "javalin",
+          "version": {
+            "requires": "7.2.2"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "plugin-rest-server-1.1.3.jar",
+          "url": "plugin-rest-server-1.1.3.jar",
+          "size": 7189281,
+          "sha512": "935441bc31d969b1423227f85a7915535b44bbfd3731f99e45822eb1ccc11d9a970d63b11d87c104c5362b79948bc8ac46145846a1253f19d10fdf617aa7b013",
+          "sha256": "917c4fbe04293110ad7a1d5bc61054ec795f7114c7252c95f92baa5179761252",
+          "sha1": "f55b70e384bbede74fcb27adfc60d20c2ce64344",
+          "md5": "322b25a1e4a73a3a3fddf2c4c7d78946"
+        }
+      ]
+    },
+    {
+      "name": "shadowRuntimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "shadowed",
+        "org.gradle.jvm.version": 21,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "plugin-rest-server-1.1.3.jar",
+          "url": "plugin-rest-server-1.1.3.jar",
+          "size": 7189281,
+          "sha512": "935441bc31d969b1423227f85a7915535b44bbfd3731f99e45822eb1ccc11d9a970d63b11d87c104c5362b79948bc8ac46145846a1253f19d10fdf617aa7b013",
+          "sha256": "917c4fbe04293110ad7a1d5bc61054ec795f7114c7252c95f92baa5179761252",
+          "sha1": "f55b70e384bbede74fcb27adfc60d20c2ce64344",
+          "md5": "322b25a1e4a73a3a3fddf2c4c7d78946"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "plugin-rest-server-1.1.3-sources.jar",
+          "url": "plugin-rest-server-1.1.3-sources.jar",
+          "size": 14124,
+          "sha512": "93fc15d556bb3019f5f36086a5ccf1714d849b3427c59bbe009c2a717ffe8b72704b064d490d9d37edcf080e03cbf85267e07c30df6166ad49d21856951ba444",
+          "sha256": "4a1c572f5aeaaeb40038a945135b7bbf167d56d1655eda37a09e65fe27511824",
+          "sha1": "09d38b92f16a62ec103eb1b1b6b1f30fe7564724",
+          "md5": "143133f661af4cefc085e2c9413014f0"
+        }
+      ]
+    }
+  ]
+}
