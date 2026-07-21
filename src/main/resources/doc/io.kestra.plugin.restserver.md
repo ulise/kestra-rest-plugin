@@ -33,6 +33,14 @@ outputs:
         X-Trace-Id: "{{ execution.id }}"
 ```
 
+## Binary and multipart bodies
+
+`trigger.body` is a UTF-8 string and corrupts binary content. `multipart/form-data` is detected
+automatically: file parts are exposed as `trigger.parts` (each with `name`, `filename`, `contentType`,
+`size`, and base64 `content`) and non-file fields as `trigger.formFields`. For other binary bodies, set
+`base64Body: true` on the route to also expose `trigger.bodyBase64` (base64 of the raw bytes). Uploads are
+capped by the trigger's `maxRequestSize` (default 10 MB).
+
 ## Authentication
 
 Set `apiKey` (from a secret) to require an API key in the `authHeader` header (default `X-Api-Key`,
