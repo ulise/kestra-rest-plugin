@@ -14,7 +14,13 @@ import io.kestra.core.models.triggers.RealtimeTriggerInterface;
 import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
+import io.kestra.core.queues.QueueFactoryInterface;
+import io.kestra.core.queues.QueueInterface;
+import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
+import io.kestra.core.serializers.JacksonMapper;
+import io.micronaut.context.ApplicationContext;
+import io.micronaut.inject.qualifiers.Qualifiers;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
@@ -30,16 +36,24 @@ import org.slf4j.Logger;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.ArrayList;
-import java.util.function.Function;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.stream.Stream;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @SuperBuilder
 @ToString
@@ -50,13 +64,18 @@ import java.util.stream.Collectors;
     title = "Expose an HTTP API that triggers one execution per request",
     description = """
         Starts an embedded HTTP server for the lifetime of the trigger and registers the declared routes on it,
-        in the spirit of Apache Camel's REST DSL. Every matching request creates one realtime execution and is
-        answered immediately with `202 Accepted` and the generated execution id — executions are asynchronous,
-        so the response does not wait for the flow to finish.
+        in the spirit of Apache Camel's REST DSL. Every matching request creates one realtime execution.
+
+        By default executions are asynchronous: the request is answered immediately with `202 Accepted` and the
+        generated execution id, without waiting for the flow to finish. Enable `wait` to serve a request/response
+        API instead — the request then blocks until the triggered execution reaches a terminal state and the HTTP
+        status, body, and headers are taken from the execution's `responseOutput` output (see `responseOutput`),
+        so the flow fully controls the response, including on non-2xx statuses.
 
         Requests that match no route get `404`, and requests violating a route's `consumes` get `415`; neither
-        creates an execution. The server is bound on the worker that runs the trigger, so the port must be free
-        there and reachable by your callers."""
+        creates an execution. When `apiKey` is set, requests must present it in the `apiKeyHeader` header or get
+        `401`. The server is bound on the worker that runs the trigger, so the port must be free there and
+        reachable by your callers."""
 )
 @Plugin(
     examples = {
@@ -93,6 +112,40 @@ import java.util.stream.Collectors;
                         produces: application/json
                       - method: DELETE
                         path: /orders/{id}
+                """
+        ),
+        @Example(
+            title = "Serve a synchronous read API behind an API key, with the flow controlling status and body.",
+            full = true,
+            code = """
+                id: read-api
+                namespace: company.myapp
+
+                tasks:
+                  - id: lookup
+                    type: io.kestra.plugin.core.log.Log
+                    message: "Looking up order {{ trigger.pathParams.id }}"
+
+                outputs:
+                  - id: response
+                    value:
+                      status: 404
+                      body: '{"status":"NOT_FOUND"}'
+                      headers:
+                        X-Trace-Id: "{{ execution.id }}"
+
+                triggers:
+                  - id: rest_server
+                    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+                    port: 8090
+                    basePath: /api
+                    wait: true
+                    waitTimeout: PT30S
+                    apiKey: "{{ secret('PARTNER_API_KEY') }}"
+                    routes:
+                      - method: GET
+                        path: /orders/{id}
+                        produces: application/json
                 """
         )
     }
@@ -139,6 +192,55 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     @Builder.Default
     private Property<String> host = Property.ofValue("0.0.0.0");
 
+    @Schema(
+        title = "Wait for the triggered execution and return its result",
+        description = """
+            Default for every route unless a route sets its own `wait`. When `true`, a request blocks until the
+            triggered execution reaches a terminal state, then the response is built from the execution's outputs
+            (see `responseOutput`). When `false` (the default), requests are answered immediately with
+            `202 Accepted` and never wait.
+
+            Synchronous mode observes the in-process execution queue; it is validated on the standalone
+            (`server local`) runner. On distributed executor backends its behaviour needs separate verification."""
+    )
+    @Builder.Default
+    private Property<Boolean> wait = Property.ofValue(false);
+
+    @Schema(
+        title = "How long a waiting request blocks before giving up",
+        description = "Applies when `wait` is enabled. On expiry the request returns `504 Gateway Timeout` and no response is built from the execution."
+    )
+    @Builder.Default
+    private Property<Duration> waitTimeout = Property.ofValue(Duration.ofSeconds(30));
+
+    @Schema(
+        title = "Execution output that shapes the HTTP response",
+        description = """
+            Applies when `wait` is enabled. The named flow output should be a map with optional `status` (HTTP
+            status code), `body` (a string returned verbatim, or an object serialised as JSON), and `headers`
+            (a map). The body is returned for every status, including non-2xx. When the output is absent, a
+            successful execution returns `200` with its outputs as JSON and a failed one returns `500`."""
+    )
+    @Builder.Default
+    private Property<String> responseOutput = Property.ofValue("response");
+
+    @Schema(
+        title = "Header that carries the API key",
+        description = "Only used when `apiKey` is set. The lookup is case-insensitive."
+    )
+    @Builder.Default
+    private Property<String> authHeader = Property.ofValue("X-Api-Key");
+
+    @Schema(
+        title = "Expected API key",
+        description = """
+            When set (non-empty), every request must present this value in the `authHeader` header or it is
+            rejected with `401` before any route matching or execution. Source it from a secret or KV. When null
+            or empty, authentication is disabled."""
+    )
+    @PluginProperty(secret = true, group = "connection")
+    private Property<String> apiKey;
+
     @Builder.Default
     @Getter(AccessLevel.NONE)
     @ToString.Exclude
@@ -156,28 +258,40 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         RunContext runContext = conditionContext.getRunContext();
         Logger logger = runContext.logger();
 
-        // Rendered once, before the server starts: routes are fixed for the lifetime of the trigger, and a
+        // Rendered once, before the server starts: configuration is fixed for the lifetime of the trigger, and a
         // rendering error should fail the trigger rather than an individual request.
         int rPort = runContext.render(this.port).as(Integer.class).orElse(8080);
         String rHost = runContext.render(this.host).as(String.class).orElse("0.0.0.0");
         String rBasePath = runContext.render(this.basePath).as(String.class).orElse("/");
-        List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath);
+        boolean rWaitDefault = runContext.render(this.wait).as(Boolean.class).orElse(false);
+        List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath, rWaitDefault);
+
+        HandlerConfig config = new HandlerConfig(
+            runContext.render(this.authHeader).as(String.class).orElse("X-Api-Key"),
+            runContext.render(this.apiKey).as(String.class).filter(k -> !k.isEmpty()).orElse(null),
+            runContext.render(this.responseOutput).as(String.class).orElse("response"),
+            runContext.render(this.waitTimeout).as(Duration.class).orElse(Duration.ofSeconds(30))
+        );
+
+        boolean anyWait = compiledRoutes.stream().anyMatch(CompiledRoute::synchronous);
 
         return Flux.create(emitter -> {
             AtomicReference<Throwable> error = new AtomicReference<>();
+            // Opened only when some route waits, so a purely async server never subscribes to the queue.
+            ExecutionAwaiter awaiter = anyWait ? ExecutionAwaiter.open(runContext) : null;
 
             try {
-                Javalin app = Javalin.create(config -> {
-                    config.startup.showJavalinBanner = false;
-                    config.startup.showOldJavalinVersionWarning = false;
+                Javalin app = Javalin.create(config2 -> {
+                    config2.startup.showJavalinBanner = false;
+                    config2.startup.showOldJavalinVersionWarning = false;
 
                     for (CompiledRoute route : compiledRoutes) {
-                        config.routes.addHttpHandler(
+                        config2.routes.addHttpHandler(
                             route.method(),
                             route.fullPath(),
-                            ctx -> handle(ctx, route, conditionContext, triggerContext, emitter)
+                            ctx -> handle(ctx, route, conditionContext, triggerContext, emitter, config, awaiter)
                         );
-                        logger.info("Registering route {} {}", route.method(), route.fullPath());
+                        logger.info("Registering route {} {}{}", route.method(), route.fullPath(), route.synchronous() ? " (wait)" : "");
                     }
                 });
 
@@ -187,6 +301,9 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                     } catch (Exception e) {
                         logger.warn("Error while stopping the embedded HTTP server: {}", e.getMessage());
                     } finally {
+                        if (awaiter != null) {
+                            awaiter.close();
+                        }
                         isActive.set(false);
                         waitForTermination.countDown();
                     }
@@ -215,8 +332,18 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         CompiledRoute route,
         ConditionContext conditionContext,
         TriggerContext triggerContext,
-        FluxSink<Execution> emitter
+        FluxSink<Execution> emitter,
+        HandlerConfig config,
+        ExecutionAwaiter awaiter
     ) {
+        // Authentication runs before route logic, so an unauthenticated caller learns nothing about the routes.
+        if (config.apiKey() != null && !authorized(ctx.headerMap(), config.authHeader(), config.apiKey())) {
+            ctx.status(401)
+                .contentType("application/json")
+                .result(json(Map.of("status", "UNAUTHORIZED")));
+            return;
+        }
+
         if (!matchesConsumes(ctx, route)) {
             ctx.status(415)
                 .contentType("application/json")
@@ -243,14 +370,138 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
 
         // Built here rather than in a downstream map() so the caller can be told which execution it started.
         Execution execution = TriggerService.generateRealtimeExecution(this, conditionContext, triggerContext, output);
+
+        if (!route.synchronous()) {
+            emitter.next(execution);
+            ctx.status(202)
+                .contentType(route.produces())
+                .result(json(Map.of(
+                    "status", "accepted",
+                    "executionId", execution.getId()
+                )));
+            return;
+        }
+
+        // Synchronous mode: register interest before emitting, so a fast completion cannot be missed.
+        CompletableFuture<Execution> completion = awaiter.register(execution.getId());
         emitter.next(execution);
 
-        ctx.status(202)
-            .contentType(route.produces())
-            .result(json(Map.of(
-                "status", "accepted",
-                "executionId", execution.getId()
-            )));
+        try {
+            Execution terminal = completion.get(config.waitTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            applyResponse(ctx, mapResponse(terminal, config.responseOutput(), route.produces()));
+        } catch (TimeoutException e) {
+            awaiter.cancel(execution.getId());
+            ctx.status(504)
+                .contentType("application/json")
+                .result(json(Map.of("status", "timeout", "executionId", execution.getId())));
+        } catch (Exception e) {
+            awaiter.cancel(execution.getId());
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            ctx.status(500)
+                .contentType("application/json")
+                .result(json(Map.of("status", "error", "error", e.getMessage() != null ? e.getMessage() : e.toString())));
+        }
+    }
+
+    /**
+     * Case-insensitive lookup of the API key header, then a constant-time comparison. HTTP header names are
+     * case-insensitive and gateways normalise them, so an exact-case {@code get} could silently find nothing and
+     * read as "no key required" — a fail-open bug this deliberately avoids.
+     */
+    static boolean authorized(Map<String, String> headers, String headerName, String expected) {
+        String provided = null;
+        for (Map.Entry<String, String> header : headers.entrySet()) {
+            if (header.getKey().equalsIgnoreCase(headerName)) {
+                provided = header.getValue();
+                break;
+            }
+        }
+
+        if (provided == null) {
+            return false;
+        }
+
+        return MessageDigest.isEqual(
+            provided.getBytes(StandardCharsets.UTF_8),
+            expected.getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    /**
+     * Maps a terminal execution to an HTTP response. When the {@code responseOutput} output is present, the flow
+     * fully controls status, body, and headers (including for non-2xx). Otherwise a successful execution yields
+     * {@code 200} with its outputs as JSON and a failed one yields {@code 500}.
+     */
+    @SuppressWarnings("unchecked")
+    static ResponseSpec mapResponse(Execution execution, String responseOutputKey, String defaultContentType) throws Exception {
+        Map<String, Object> outputs = execution.getOutputs();
+        boolean success = execution.getState().isTerminatedNoFail();
+        Object mapped = outputs == null ? null : outputs.get(responseOutputKey);
+
+        if (mapped instanceof Map<?, ?> response) {
+            int status = toStatus(response.get("status"), success);
+            String body = toBody(response.get("body"));
+            Map<String, String> headers = toHeaders(response.get("headers"));
+            String contentType = headers.entrySet().stream()
+                .filter(h -> h.getKey().equalsIgnoreCase("Content-Type"))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(defaultContentType);
+
+            return new ResponseSpec(status, body, headers, contentType);
+        }
+
+        String body = outputs == null || outputs.isEmpty() ? "" : JacksonMapper.ofJson().writeValueAsString(outputs);
+        return new ResponseSpec(success ? 200 : 500, body, Map.of(), defaultContentType);
+    }
+
+    private static int toStatus(Object status, boolean success) {
+        if (status instanceof Number number) {
+            return number.intValue();
+        }
+        if (status instanceof String string && !string.isBlank()) {
+            return Integer.parseInt(string.trim());
+        }
+
+        return success ? 200 : 500;
+    }
+
+    private static String toBody(Object body) throws Exception {
+        if (body == null) {
+            return "";
+        }
+        if (body instanceof String string) {
+            return string;
+        }
+
+        return JacksonMapper.ofJson().writeValueAsString(body);
+    }
+
+    private static Map<String, String> toHeaders(Object headers) {
+        if (!(headers instanceof Map<?, ?> map)) {
+            return Map.of();
+        }
+
+        Map<String, String> result = new LinkedHashMap<>();
+        map.forEach((key, value) -> {
+            if (key != null && value != null) {
+                result.put(key.toString(), value.toString());
+            }
+        });
+
+        return result;
+    }
+
+    private static void applyResponse(Context ctx, ResponseSpec spec) {
+        ctx.status(spec.status());
+        spec.headers().entrySet().stream()
+            // Content-Type is set through contentType() below, so it is not duplicated here.
+            .filter(h -> !h.getKey().equalsIgnoreCase("Content-Type"))
+            .forEach(h -> ctx.header(h.getKey(), h.getValue()));
+        ctx.contentType(spec.contentType());
+        ctx.result(spec.body());
     }
 
     private boolean matchesConsumes(Context ctx, CompiledRoute route) {
@@ -274,7 +525,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         return value.trim().toLowerCase(Locale.ROOT);
     }
 
-    private List<CompiledRoute> compileRoutes(RunContext runContext, String basePath) throws Exception {
+    private List<CompiledRoute> compileRoutes(RunContext runContext, String basePath, boolean waitDefault) throws Exception {
         List<CompiledRoute> compiled = new ArrayList<>(routes.size());
 
         for (RouteDefinition route : routes) {
@@ -289,7 +540,8 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 method,
                 normalizePath(basePath, rawPath),
                 runContext.render(route.getConsumes()).as(String.class).orElse(null),
-                runContext.render(route.getProduces()).as(String.class).orElse("application/json")
+                runContext.render(route.getProduces()).as(String.class).orElse("application/json"),
+                runContext.render(route.getWait()).as(Boolean.class).orElse(waitDefault)
             ));
         }
 
@@ -392,7 +644,85 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     /**
      * A route with every property already rendered and validated.
      */
-    private record CompiledRoute(HandlerType method, String fullPath, String consumes, String produces) {
+    private record CompiledRoute(HandlerType method, String fullPath, String consumes, String produces, boolean synchronous) {
+    }
+
+    /**
+     * Per-request configuration rendered once for the trigger's lifetime.
+     */
+    private record HandlerConfig(String authHeader, String apiKey, String responseOutput, Duration waitTimeout) {
+    }
+
+    /**
+     * A fully resolved HTTP response derived from a terminal execution.
+     */
+    record ResponseSpec(int status, String body, Map<String, String> headers, String contentType) {
+    }
+
+    /**
+     * Awaits terminal executions by observing the execution queue, and hands each waiting request the execution it
+     * started. One subscription is shared for the trigger lifetime; requests register by execution id.
+     */
+    static final class ExecutionAwaiter implements AutoCloseable {
+
+        private final Map<String, CompletableFuture<Execution>> pending = new ConcurrentHashMap<>();
+        private final AtomicReference<Runnable> unsubscribe = new AtomicReference<>();
+
+        @SuppressWarnings({"unchecked", "removal"})
+        static ExecutionAwaiter open(RunContext runContext) {
+            if (!(runContext instanceof DefaultRunContext defaultRunContext)) {
+                throw new IllegalStateException(
+                    "Synchronous 'wait' mode requires the standard Kestra runtime; got " + runContext.getClass().getName()
+                );
+            }
+
+            ApplicationContext applicationContext = defaultRunContext.getApplicationContext();
+            QueueInterface<Execution> executionQueue = applicationContext.getBean(
+                QueueInterface.class,
+                Qualifiers.byName(QueueFactoryInterface.EXECUTION_NAMED)
+            );
+
+            ExecutionAwaiter awaiter = new ExecutionAwaiter();
+            awaiter.unsubscribe.set(executionQueue.receive(either -> {
+                if (either != null && either.isLeft()) {
+                    awaiter.onExecution(either.getLeft());
+                }
+            }));
+
+            return awaiter;
+        }
+
+        CompletableFuture<Execution> register(String executionId) {
+            CompletableFuture<Execution> completion = new CompletableFuture<>();
+            pending.put(executionId, completion);
+
+            return completion;
+        }
+
+        void cancel(String executionId) {
+            pending.remove(executionId);
+        }
+
+        void onExecution(Execution execution) {
+            if (execution == null || execution.getState() == null || !execution.getState().isTerminated()) {
+                return;
+            }
+
+            CompletableFuture<Execution> completion = pending.remove(execution.getId());
+            if (completion != null) {
+                completion.complete(execution);
+            }
+        }
+
+        @Override
+        public void close() {
+            Runnable runnable = unsubscribe.getAndSet(null);
+            if (runnable != null) {
+                runnable.run();
+            }
+            pending.values().forEach(completion -> completion.cancel(true));
+            pending.clear();
+        }
     }
 
     @Builder
