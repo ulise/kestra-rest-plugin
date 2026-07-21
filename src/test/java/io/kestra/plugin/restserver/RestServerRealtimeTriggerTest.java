@@ -225,13 +225,23 @@ class RestServerRealtimeTriggerTest {
 
     @Test
     void authorizedIsCaseInsensitiveOnHeaderNameAndFailsClosed() {
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "s3cret"), "X-Api-Key", "s3cret"), is(true));
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "s3cret"), "X-Api-Key", List.of("s3cret")), is(true));
         // Header names are case-insensitive: a normalised "x-api-key" must still match.
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("x-api-key", "s3cret"), "X-Api-Key", "s3cret"), is(true));
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("x-api-key", "s3cret"), "X-Api-Key", List.of("s3cret")), is(true));
         // Wrong value is rejected.
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "nope"), "X-Api-Key", "s3cret"), is(false));
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "nope"), "X-Api-Key", List.of("s3cret")), is(false));
         // Missing header fails closed, never "no key required".
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of(), "X-Api-Key", "s3cret"), is(false));
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of(), "X-Api-Key", List.of("s3cret")), is(false));
+    }
+
+    @Test
+    void authorizedAcceptsAnyKeyInTheList() {
+        List<String> keys = List.of("key-aaa", "key-bbb", "key-ccc");
+        // Any listed key is accepted.
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "key-aaa"), "X-Api-Key", keys), is(true));
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "key-ccc"), "X-Api-Key", keys), is(true));
+        // A key not in the list is rejected.
+        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "key-zzz"), "X-Api-Key", keys), is(false));
     }
 
     @Test
@@ -255,6 +265,36 @@ class RestServerRealtimeTriggerTest {
             // Correct key, supplied under a lower-cased header name, is accepted.
             assertThat(send(request(port, "/api/orders").header("x-api-key", "s3cret").GET()).statusCode(), is(202));
             await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+        });
+    }
+
+    @Test
+    void apiKeysListAcceptsAnyPartnerKeyAndForwardsItToTheFlow() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .apiKeys(Property.ofValue(List.of("key-aaa", "key-bbb")))
+            .routes(List.of(route("GET", "/orders", null, null)))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            // Two different partner keys are both accepted.
+            assertThat(send(request(port, "/api/orders").header("X-Api-Key", "key-aaa").GET()).statusCode(), is(202));
+            assertThat(send(request(port, "/api/orders").header("X-Api-Key", "key-bbb").GET()).statusCode(), is(202));
+            // A key outside the list is rejected.
+            assertThat(send(request(port, "/api/orders").header("X-Api-Key", "key-zzz").GET()).statusCode(), is(401));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 2);
+            // The matched key reaches the flow so it can map the caller to partner data.
+            String forwarded = output(executions.getFirst()).getHeaders().entrySet().stream()
+                .filter(e -> e.getKey().equalsIgnoreCase("X-Api-Key"))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(null);
+            assertThat(forwarded, is("key-aaa"));
         });
     }
 

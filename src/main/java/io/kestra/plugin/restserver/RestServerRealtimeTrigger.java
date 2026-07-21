@@ -40,6 +40,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -227,7 +228,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
 
     @Schema(
         title = "Header that carries the API key",
-        description = "Only used when `apiKey` is set. The lookup is case-insensitive."
+        description = "Only used when `apiKey` or `apiKeys` is set. The lookup is case-insensitive."
     )
     @Builder.Default
     private Property<String> authHeader = Property.ofValue("X-Api-Key");
@@ -237,10 +238,21 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         description = """
             When set (non-empty), every request must present this value in the `authHeader` header or it is
             rejected with `401` before any route matching or execution. Source it from a secret or KV. When null
-            or empty, authentication is disabled."""
+            or empty, authentication is disabled unless `apiKeys` is set."""
     )
     @PluginProperty(secret = true, group = "connection")
     private Property<String> apiKey;
+
+    @Schema(
+        title = "Accepted API keys, for multiple callers",
+        description = """
+            A request is authorized when its key matches `apiKey` or any entry here — use this to front several
+            partners that each present their own key. The plugin only gates on membership; the matched key still
+            reaches the flow as `{{ trigger.headers }}`, so the flow can map it to the specific caller. Combined
+            with `apiKey`; when both are null or empty, authentication is disabled."""
+    )
+    @PluginProperty(secret = true, group = "connection")
+    private Property<List<String>> apiKeys;
 
     @Builder.Default
     @Getter(AccessLevel.NONE)
@@ -267,9 +279,20 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         boolean rWaitDefault = runContext.render(this.wait).as(Boolean.class).orElse(false);
         List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath, rWaitDefault);
 
+        // The gate accepts any of apiKey plus every apiKeys entry; the matched key still reaches the flow.
+        List<String> validKeys = new ArrayList<>();
+        runContext.render(this.apiKey).as(String.class).filter(k -> !k.isEmpty()).ifPresent(validKeys::add);
+        if (this.apiKeys != null) {
+            for (String key : runContext.render(this.apiKeys).asList(String.class)) {
+                if (key != null && !key.isEmpty()) {
+                    validKeys.add(key);
+                }
+            }
+        }
+
         HandlerConfig config = new HandlerConfig(
             runContext.render(this.authHeader).as(String.class).orElse("X-Api-Key"),
-            runContext.render(this.apiKey).as(String.class).filter(k -> !k.isEmpty()).orElse(null),
+            List.copyOf(validKeys),
             runContext.render(this.responseOutput).as(String.class).orElse("response"),
             runContext.render(this.waitTimeout).as(Duration.class).orElse(Duration.ofSeconds(30))
         );
@@ -338,7 +361,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         ExecutionAwaiter awaiter
     ) {
         // Authentication runs before route logic, so an unauthenticated caller learns nothing about the routes.
-        if (config.apiKey() != null && !authorized(ctx.headerMap(), config.authHeader(), config.apiKey())) {
+        if (!config.validKeys().isEmpty() && !authorized(ctx.headerMap(), config.authHeader(), config.validKeys())) {
             ctx.status(401)
                 .contentType("application/json")
                 .result(json(Map.of("status", "UNAUTHORIZED")));
@@ -407,11 +430,13 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     }
 
     /**
-     * Case-insensitive lookup of the API key header, then a constant-time comparison. HTTP header names are
-     * case-insensitive and gateways normalise them, so an exact-case {@code get} could silently find nothing and
-     * read as "no key required" — a fail-open bug this deliberately avoids.
+     * Case-insensitive lookup of the API key header, then a constant-time comparison against each accepted key.
+     * HTTP header names are case-insensitive and gateways normalise them, so an exact-case {@code get} could
+     * silently find nothing and read as "no key required" — a fail-open bug this deliberately avoids. The request
+     * is authorized when the presented key matches any accepted key; every candidate is compared (no early exit)
+     * so the number of comparisons does not depend on which key matched.
      */
-    static boolean authorized(Map<String, String> headers, String headerName, String expected) {
+    static boolean authorized(Map<String, String> headers, String headerName, Collection<String> expectedKeys) {
         String provided = null;
         for (Map.Entry<String, String> header : headers.entrySet()) {
             if (header.getKey().equalsIgnoreCase(headerName)) {
@@ -424,10 +449,13 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             return false;
         }
 
-        return MessageDigest.isEqual(
-            provided.getBytes(StandardCharsets.UTF_8),
-            expected.getBytes(StandardCharsets.UTF_8)
-        );
+        byte[] providedBytes = provided.getBytes(StandardCharsets.UTF_8);
+        boolean match = false;
+        for (String expected : expectedKeys) {
+            match |= MessageDigest.isEqual(providedBytes, expected.getBytes(StandardCharsets.UTF_8));
+        }
+
+        return match;
     }
 
     /**
@@ -651,7 +679,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     /**
      * Per-request configuration rendered once for the trigger's lifetime.
      */
-    private record HandlerConfig(String authHeader, String apiKey, String responseOutput, Duration waitTimeout) {
+    private record HandlerConfig(String authHeader, List<String> validKeys, String responseOutput, Duration waitTimeout) {
     }
 
     /**
