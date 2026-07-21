@@ -85,10 +85,11 @@ Content-Type: application/json
 | `authHeader`     | `String`      | `X-Api-Key` | Header carrying the API key (case-insensitive lookup).            |
 | `apiKey`         | `String`      | _(none)_    | Expected API key; when set, requests without it get `401`. Empty/null disables auth. Store it as a secret. |
 | `apiKeys`        | `List<String>`| _(none)_    | Accepted keys for multiple callers; a request passes if its key matches `apiKey` or any entry. The matched key still reaches the flow. Store as secrets. |
+| `maxRequestSize` | `Long`        | `10485760`  | Maximum request size in bytes (incl. multipart uploads). Defaults to 10 MB. |
 
-Each route takes `method` (required), `path` (required), `consumes`, `produces`, and an optional `wait`
-that overrides the trigger-level default. All of these are Kestra properties, so they accept Pebble
-expressions.
+Each route takes `method` (required), `path` (required), `consumes`, `produces`, an optional `wait`
+that overrides the trigger-level default, and an optional `base64Body` (see [Binary and multipart bodies](#binary-and-multipart-bodies)).
+All of these are Kestra properties, so they accept Pebble expressions.
 
 ### Trigger outputs
 
@@ -100,8 +101,36 @@ expressions.
 | `trigger.pathParams`   | `Map<String, String>` | Parameters extracted from the URL.             |
 | `trigger.queryParams`  | `Map<String, String>` | Repeated parameters are joined with a comma.   |
 | `trigger.headers`      | `Map<String, String>` | Request headers.                               |
-| `trigger.body`         | `String`              | Raw body, decoded as a string.                 |
+| `trigger.body`         | `String`              | Raw body, decoded as a string (non-multipart).  |
+| `trigger.bodyBase64`   | `String`              | Raw body base64-encoded; only when the route sets `base64Body: true`. |
+| `trigger.parts`        | `List<Part>`          | Uploaded file parts of a multipart request; each `Part` is `{name, filename, contentType, size, content}` with `content` base64. |
+| `trigger.formFields`   | `Map<String,List<String>>` | Non-file form fields of a multipart request. |
 | `trigger.contentType`  | `String`              | `Content-Type` of the request.                 |
+
+### Binary and multipart bodies
+
+`trigger.body` is a UTF-8 string, which corrupts binary content. Two additions carry bytes safely:
+
+- **`multipart/form-data`** is detected automatically. File parts are exposed as `trigger.parts` (each part's
+  `content` is **base64-encoded**, with `name`/`filename`/`contentType`/`size`), and non-file fields as
+  `trigger.formFields`. Decode a part in the flow with `{{ trigger.parts[0].content | base64decode }}` or
+  hand it to a task that accepts base64.
+- **Other binary bodies** (e.g. `application/octet-stream`): set `base64Body: true` on the route to also get
+  `trigger.bodyBase64` (base64 of the raw bytes). This is opt-in so text/JSON routes don't carry a redundant
+  base64 copy in stored executions.
+
+```yaml
+routes:
+  - method: POST
+    path: /fdl-feedback        # JSON or multipart with result photos
+    produces: application/json
+  - method: POST
+    path: /images
+    base64Body: true           # binary image body as {{ trigger.bodyBase64 }}
+```
+
+Uploads are capped by `maxRequestSize` (default 10 MB). base64 inflates payloads ~33% and lands in stored
+execution variables, so keep `maxRequestSize` sized to your real uploads.
 
 ### Response semantics
 

@@ -1,8 +1,10 @@
 package io.kestra.plugin.restserver;
 
 import io.javalin.Javalin;
+import io.javalin.config.SizeUnit;
 import io.javalin.http.Context;
 import io.javalin.http.HandlerType;
+import io.javalin.http.UploadedFile;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -39,7 +41,11 @@ import reactor.core.publisher.FluxSink;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -195,6 +201,13 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     private Property<String> host = Property.ofValue("0.0.0.0");
 
     @Schema(
+        title = "Maximum request size in bytes",
+        description = "Caps the request body, including `multipart/form-data` uploads. Defaults to 10 MB."
+    )
+    @Builder.Default
+    private Property<Long> maxRequestSize = Property.ofValue(10L * 1024 * 1024);
+
+    @Schema(
         title = "Wait for the triggered execution and return its result",
         description = """
             Default for every route unless a route sets its own `wait`. When `true`, a request blocks until the
@@ -277,6 +290,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         String rHost = runContext.render(this.host).as(String.class).orElse("0.0.0.0");
         String rBasePath = runContext.render(this.basePath).as(String.class).orElse("/");
         boolean rWaitDefault = runContext.render(this.wait).as(Boolean.class).orElse(false);
+        long rMaxRequestSize = runContext.render(this.maxRequestSize).as(Long.class).orElse(10L * 1024 * 1024);
         List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath, rWaitDefault);
 
         // The gate accepts any of apiKey plus every apiKeys entry; the matched key still reaches the flow.
@@ -308,6 +322,13 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 Javalin app = Javalin.create(config2 -> {
                     config2.startup.showJavalinBanner = false;
                     config2.startup.showOldJavalinVersionWarning = false;
+
+                    // Raise the default 1 MB caps so real uploads (e.g. photos) are accepted.
+                    config2.http.maxRequestSize = rMaxRequestSize;
+                    config2.jetty.multipartConfig.maxFileSize(rMaxRequestSize, SizeUnit.BYTES);
+                    config2.jetty.multipartConfig.maxTotalRequestSize(rMaxRequestSize, SizeUnit.BYTES);
+                    config2.jetty.multipartConfig.maxInMemoryFileSize(
+                        (int) Math.min(rMaxRequestSize, Integer.MAX_VALUE), SizeUnit.BYTES);
 
                     for (CompiledRoute route : compiledRoutes) {
                         config2.routes.addHttpHandler(
@@ -378,7 +399,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             return;
         }
 
-        Output output = Output.builder()
+        Output.OutputBuilder builder = Output.builder()
             .method(ctx.method().name())
             .path(ctx.path())
             .matchedRoute(route.fullPath())
@@ -388,9 +409,20 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                     .collect(Collectors.toMap(Map.Entry::getKey, e -> String.join(",", e.getValue())))
             )
             .headers(ctx.headerMap())
-            .body(ctx.body())
-            .contentType(ctx.contentType())
-            .build();
+            .contentType(ctx.contentType());
+
+        if (ctx.isMultipartFormData()) {
+            // File bytes would not survive string decoding, so expose the parts (base64) and text fields
+            // instead of the raw multipart envelope.
+            builder.parts(uploadedParts(ctx)).formFields(ctx.formParamMap());
+        } else {
+            builder.body(ctx.body());
+            if (route.base64Body()) {
+                builder.bodyBase64(Base64.getEncoder().encodeToString(ctx.bodyAsBytes()));
+            }
+        }
+
+        Output output = builder.build();
 
         // Built here rather than in a downstream map() so the caller can be told which execution it started.
         Execution execution = TriggerService.generateRealtimeExecution(this, conditionContext, triggerContext, output);
@@ -533,6 +565,35 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         ctx.result(spec.body());
     }
 
+    /**
+     * Reads every uploaded file part into a {@link Part} with its bytes base64-encoded, so binary content
+     * (images, etc.) survives the trip through Kestra's string/JSON trigger variables.
+     */
+    private static List<Part> uploadedParts(Context ctx) {
+        List<Part> parts = new ArrayList<>();
+
+        ctx.uploadedFileMap().forEach((name, files) -> {
+            for (UploadedFile file : files) {
+                byte[] bytes;
+                try (InputStream in = file.content()) {
+                    bytes = in.readAllBytes();
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to read uploaded part '" + name + "'", e);
+                }
+
+                parts.add(Part.builder()
+                    .name(name)
+                    .filename(file.filename())
+                    .contentType(file.contentType())
+                    .size(file.size())
+                    .content(Base64.getEncoder().encodeToString(bytes))
+                    .build());
+            }
+        });
+
+        return parts;
+    }
+
     private boolean matchesConsumes(Context ctx, CompiledRoute route) {
         if (route.consumes() == null) {
             return true;
@@ -570,7 +631,8 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 normalizePath(basePath, rawPath),
                 runContext.render(route.getConsumes()).as(String.class).orElse(null),
                 runContext.render(route.getProduces()).as(String.class).orElse("application/json"),
-                runContext.render(route.getWait()).as(Boolean.class).orElse(waitDefault)
+                runContext.render(route.getWait()).as(Boolean.class).orElse(waitDefault),
+                runContext.render(route.getBase64Body()).as(Boolean.class).orElse(false)
             ));
         }
 
@@ -673,7 +735,8 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     /**
      * A route with every property already rendered and validated.
      */
-    private record CompiledRoute(HandlerType method, String fullPath, String consumes, String produces, boolean synchronous) {
+    private record CompiledRoute(HandlerType method, String fullPath, String consumes, String produces,
+                                 boolean synchronous, boolean base64Body) {
     }
 
     /**
@@ -782,7 +845,42 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         @Schema(title = "Raw request body, decoded as a string")
         private final String body;
 
+        @Schema(
+            title = "Raw request body, base64-encoded",
+            description = "Populated only when the route sets `base64Body: true`, so binary bodies survive intact."
+        )
+        private final String bodyBase64;
+
+        @Schema(
+            title = "Uploaded file parts of a `multipart/form-data` request",
+            description = "Each part's `content` is base64-encoded. Empty for non-multipart requests."
+        )
+        private final List<Part> parts;
+
+        @Schema(title = "Non-file form fields of a `multipart/form-data` request")
+        private final Map<String, List<String>> formFields;
+
         @Schema(title = "`Content-Type` of the request")
         private final String contentType;
+    }
+
+    @Builder
+    @Getter
+    public static class Part {
+
+        @Schema(title = "Form field name of the part")
+        private final String name;
+
+        @Schema(title = "Uploaded file name, if the part is a file")
+        private final String filename;
+
+        @Schema(title = "`Content-Type` of the part")
+        private final String contentType;
+
+        @Schema(title = "Size of the part in bytes")
+        private final long size;
+
+        @Schema(title = "Part content, base64-encoded")
+        private final String content;
     }
 }

@@ -17,6 +17,7 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.ServerSocket;
@@ -24,7 +25,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -40,6 +43,7 @@ import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest
@@ -436,9 +440,126 @@ class RestServerRealtimeTriggerTest {
         });
     }
 
+    // -------------------------------------------------------------------------------------------------------------
+    // #8 Multipart and binary bodies
+    // -------------------------------------------------------------------------------------------------------------
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void multipartExposesFilePartsIntactAndFormFields() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/upload", null, null));
+
+        // Bytes that are not valid UTF-8 — they would be mangled by string decoding.
+        byte[] photo = {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, 0x00, 0x10, (byte) 0x89, (byte) 0xC3, 0x7F, (byte) 0x80};
+        String boundary = "----testBoundaryXYZ";
+        byte[] body = multipartBody(boundary,
+            new PartSpec("photo", "result.jpg", "image/jpeg", photo),
+            new PartSpec("note", null, null, "hello world".getBytes(StandardCharsets.UTF_8)));
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/upload")
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+            assertThat(response.statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Map<String, Object> vars = (Map<String, Object>) executions.getFirst().getTrigger().getVariables();
+
+            List<Map<String, Object>> parts = (List<Map<String, Object>>) vars.get("parts");
+            assertThat(parts, hasSize(1));
+            Map<String, Object> part = parts.getFirst();
+            assertThat(part.get("name"), is("photo"));
+            assertThat(part.get("filename"), is("result.jpg"));
+            assertThat(part.get("contentType"), is("image/jpeg"));
+            // The bytes round-trip through base64 unchanged — the crux of the issue.
+            assertThat(Base64.getDecoder().decode((String) part.get("content")), is(photo));
+
+            Map<String, List<String>> formFields = (Map<String, List<String>>) vars.get("formFields");
+            assertThat(formFields.get("note").getFirst(), is("hello world"));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void base64BodyRouteRoundTripsBinaryBody() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .routes(List.of(RouteDefinition.builder()
+                .method(Property.ofValue("POST"))
+                .path(Property.ofValue("/blob"))
+                .base64Body(Property.ofValue(true))
+                .build()))
+            .build();
+
+        byte[] blob = {0x00, (byte) 0xFF, 0x10, (byte) 0x80, 0x7F, (byte) 0xC3};
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/blob")
+                .header("Content-Type", "application/octet-stream")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(blob)));
+            assertThat(response.statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Map<String, Object> vars = (Map<String, Object>) executions.getFirst().getTrigger().getVariables();
+            assertThat(Base64.getDecoder().decode((String) vars.get("bodyBase64")), is(blob));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void nonMultipartWithoutFlagExposesNoBase64OrParts() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/orders", "application/json", null));
+
+        withRunningServer(trigger, port, executions -> {
+            send(request(port, "/api/orders").header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"item\":\"widget\"}")));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Map<String, Object> vars = (Map<String, Object>) executions.getFirst().getTrigger().getVariables();
+            // Text/JSON is unchanged: the string body is present, the binary extras are not.
+            assertThat(vars.get("body"), is("{\"item\":\"widget\"}"));
+            assertThat(vars.get("bodyBase64"), is(nullValue()));
+            assertThat(vars.get("parts"), is(nullValue()));
+        });
+    }
+
     // -----------------------------------------------------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Builds a {@code multipart/form-data} body for the given parts, matching the supplied boundary.
+     */
+    private static byte[] multipartBody(String boundary, PartSpec... parts) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (PartSpec part : parts) {
+            out.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
+            StringBuilder header = new StringBuilder("Content-Disposition: form-data; name=\"").append(part.name).append('"');
+            if (part.filename != null) {
+                header.append("; filename=\"").append(part.filename).append('"');
+            }
+            header.append("\r\n");
+            out.write(header.toString().getBytes(StandardCharsets.UTF_8));
+            if (part.contentType != null) {
+                out.write(("Content-Type: " + part.contentType + "\r\n").getBytes(StandardCharsets.UTF_8));
+            }
+            out.write("\r\n".getBytes(StandardCharsets.UTF_8));
+            out.write(part.content);
+            out.write("\r\n".getBytes(StandardCharsets.UTF_8));
+        }
+        out.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+
+        return out.toByteArray();
+    }
+
+    private record PartSpec(String name, String filename, String contentType, byte[] content) {
+    }
 
     /**
      * Runs {@code assertions} against a started server, and tears the server down afterwards.

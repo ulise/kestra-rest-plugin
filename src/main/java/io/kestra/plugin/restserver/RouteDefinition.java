@@ -52,4 +52,13 @@ public class RouteDefinition {
             the trigger-level `wait` applies."""
     )
     private Property<Boolean> wait;
+
+    @Schema(
+        title = "Expose the raw body base64-encoded",
+        description = """
+            When `true`, the request body is also exposed as `{{ trigger.bodyBase64 }}` (base64 of the raw
+            bytes), so binary bodies such as `application/octet-stream` survive intact. Does not apply to
+            `multipart/form-data` requests, whose file parts are always exposed via `{{ trigger.parts }}`."""
+    )
+    private Property<Boolean> base64Body;
 }
