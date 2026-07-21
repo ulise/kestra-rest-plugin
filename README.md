@@ -188,7 +188,16 @@ documented.
 
 ## Deploy
 
-Copy the shadow jar into Kestra's plugins directory:
+Install by coordinates from the public Maven repository (served from the `gh-pages` branch, no credentials
+required) — the cleanest option for a custom image:
+
+```dockerfile
+FROM kestra/kestra:1.3.28
+RUN /app/kestra plugins install io.kestra.plugin:plugin-rest-server:1.1.2 \
+      --repositories https://ulise.github.io/kestra-rest-plugin/maven
+```
+
+Or copy the shadow jar into Kestra's plugins directory:
 
 ```bash
 cp build/libs/plugin-rest-server-*.jar /path/to/kestra/plugins/
