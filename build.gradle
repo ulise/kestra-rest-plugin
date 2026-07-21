@@ -189,6 +189,20 @@ tasks.withType(GenerateModuleMetadata).configureEach {
     suppressedValidationErrors.add('enforced-platform')
 }
 
+// Publish the existing (shaded) `maven` publication into a static, file-based Maven repository that is
+// served publicly from the `gh-pages` branch — no credentials needed to consume, unlike GitHub Packages.
+// The publish workflow points `ghPagesRepoDir` at a checkout of gh-pages so maven-metadata.xml merges
+// across releases; locally it defaults to a build directory.
+publishing {
+    repositories {
+        maven {
+            name = 'GhPages'
+            url = file(providers.gradleProperty('ghPagesRepoDir')
+                .getOrElse(layout.buildDirectory.dir('gh-pages-maven').get().asFile.absolutePath)).toURI()
+        }
+    }
+}
+
 jar {
     manifest {
         attributes(
