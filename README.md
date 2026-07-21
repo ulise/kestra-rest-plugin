@@ -123,6 +123,7 @@ by `responseOutput`, default `response`):
 ```yaml
 outputs:
   - id: response
+    type: JSON                        # required by Kestra; the value below is the response map
     value:
       status: 404                     # HTTP status; default 200 on success, 500 on failure
       body: '{"status":"NOT_FOUND"}'  # a string is returned verbatim; an object is serialised as JSON

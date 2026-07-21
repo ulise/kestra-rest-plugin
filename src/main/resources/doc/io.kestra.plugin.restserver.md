@@ -25,6 +25,7 @@ non-2xx statuses. If the execution does not finish within `waitTimeout`, the req
 ```yaml
 outputs:
   - id: response
+    type: JSON
     value:
       status: 404
       body: '{"status":"NOT_FOUND"}'

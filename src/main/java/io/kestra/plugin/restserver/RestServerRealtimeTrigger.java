@@ -128,6 +128,7 @@ import java.util.stream.Stream;
 
                 outputs:
                   - id: response
+                    type: JSON
                     value:
                       status: 404
                       body: '{"status":"NOT_FOUND"}'
