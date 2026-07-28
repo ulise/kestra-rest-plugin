@@ -173,10 +173,13 @@ the execution does not finish within `waitTimeout`, the request returns `504` (t
 Synchronous mode requires the trigger's worker and the executor to share a JVM — the case for
 `kestra server local`, `kestra server standalone`, and a single-replica Helm `standalone` deployment. It is
 **queue-backend agnostic**: the trigger subscribes to the execution queue through Kestra's `QueueInterface`,
-so the memory, H2, MySQL and Postgres queues all work. `server local` itself runs on the H2 JDBC queue, so
-the JDBC path is the one already exercised. On JDBC backends the queue is polled rather than dispatched
-in-process, which adds up to `kestra.jdbc.queues.max-poll-interval` (default 500 ms) of latency on an
-otherwise idle instance; lower it if that matters for your endpoint.
+so the memory, H2, MySQL and Postgres queues all work. Verified on both H2 (`server local`) and postgres
+(`server standalone`) — see [Testing against postgres](#testing-against-postgres).
+
+On JDBC backends the queue is polled rather than dispatched in-process, which costs latency on an
+otherwise idle instance: measured against postgres, a request arriving while the poller is hot returns in
+~0.1–0.3 s, one arriving after 60 s of silence in ~0.8 s. That gap is
+`kestra.jdbc.queues.max-poll-interval` (default 500 ms); lower it if it matters for your endpoint.
 
 Distributed deployments are **not** supported, and the reason is the HTTP server rather than the queue: a
 realtime trigger is evaluated on exactly one worker, so only that worker binds the port. Scaling past one
@@ -249,12 +252,7 @@ Or use the provided Docker setup, which also publishes the plugin's port:
 ```bash
 ./gradlew shadowJar && docker compose up -d
 
-# Kestra 1.x needs its basic-auth user created once, on first boot:
-curl -X POST localhost:8080/api/v1/basicAuth \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin@kestra.io","password":"Admin1234"}'
-
-curl -u admin@kestra.io:Admin1234 -X POST localhost:8080/api/v1/main/flows \
+curl -u 'admin@kestra.io:Admin1234!' -X POST localhost:8080/api/v1/main/flows \
   -H 'Content-Type: application/x-yaml' --data-binary @examples/order-api.yaml
 
 curl -i -X POST localhost:8090/api/orders \
@@ -263,6 +261,29 @@ curl -i -X POST localhost:8090/api/orders \
 
 Note that `docker-compose.yml` mounts `build/libs` as the plugins directory, so keep only the shadow jar
 there.
+
+### Testing against postgres
+
+That default stack is `server local`, which runs on H2. `docker-compose.yml` also carries a `postgres`
+profile — `server standalone` with `kestra.queue.type: postgres`, the default production shape of an OSS
+install — on separate ports and volumes so both stacks can run side by side:
+
+```bash
+./gradlew shadowJar && docker compose --profile postgres up -d kestra-postgres
+
+curl -u 'admin@kestra.io:Admin1234!' -X POST localhost:8081/api/v1/main/flows \
+  -H 'Content-Type: application/x-yaml' --data-binary @examples/sync-api.yaml
+
+curl -i localhost:8091/api/orders/42   # 200, {"id":"42","status":"FOUND"}
+curl -i localhost:8091/api/orders/0    # 404, {"id":"0","status":"NOT_FOUND"}
+```
+
+Use it for anything queue-dependent — above all [synchronous mode](#synchronous-mode-and-flow-controlled-responses),
+which is the only feature whose behaviour could plausibly differ per backend. `examples/sync-api.yaml`
+exercises `wait: true` including the flow-controlled non-2xx path.
+
+The images are pinned to the Kestra version in the [compatibility table](#compatibility) rather than
+`latest`, which currently resolves to a 2.x nightly this plugin is not built against.
 
 **When bind-mounting the plugins directory into a container, the source must be a path the Docker daemon
 can actually see.** A directory the daemon cannot read (for example under `/tmp` on some setups, or on a

@@ -1,23 +1,35 @@
 # Single-node Kestra with the plugin mounted, for manual testing.
 #
-#   ./gradlew shadowJar && docker compose up
+# Two stacks are defined, on separate ports and volumes so they can run side by side:
 #
-# Then open http://localhost:8080, create the flow from examples/order-api.yaml, and call:
+#   ./gradlew shadowJar && docker compose up
+#     `server local` — H2 queue and repository. UI on :8080, plugin routes on :8090.
+#
+#   ./gradlew shadowJar && docker compose --profile postgres up kestra-postgres
+#     `server standalone` — postgres queue and repository, the default production shape of an OSS
+#     install. UI on :8081, plugin routes on :8091. Use this to check anything queue-dependent,
+#     above all synchronous `wait: true` mode; see examples/sync-api.yaml.
+#
+# Then open the UI, create the flow from examples/, and call:
 #   curl -i -X POST localhost:8090/api/orders -H 'Content-Type: application/json' -d '{"item":"widget"}'
 services:
   kestra:
-    image: kestra/kestra:latest
+    # Pinned, not `latest`: `latest` currently resolves to a 2.x nightly, which this plugin is not
+    # built against. Keep in step with the compatibility table in README.md.
+    image: kestra/kestra:v1.3.28
     command: server local
     user: root
     environment:
-      # Local credentials for the UI and API. Kestra 1.x requires basic auth to be configured.
+      # Local credentials for the UI and API. Kestra 1.x enables basic auth by default, so it has to
+      # be given credentials or nothing can log in. The key is `kestra.server.basicAuth`; a password
+      # without a digit and a special character is rejected at startup.
       KESTRA_CONFIGURATION: |
         kestra:
-          security:
-            basic-auth:
+          server:
+            basicAuth:
               enabled: true
               username: admin@kestra.io
-              password: Admin1234
+              password: Admin1234!
     ports:
       - "8080:8080"   # Kestra UI and API
       - "8090:8090"   # the port declared by the trigger in examples/order-api.yaml
@@ -27,5 +39,64 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/kestra-wd:/tmp/kestra-wd
 
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: k3str4
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Kestra fails to start against a database still running initdb, so gate it on a real check.
+      test: ["CMD-SHELL", "pg_isready -d kestra -U kestra"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  kestra-postgres:
+    image: kestra/kestra:v1.3.28
+    # `standalone` rather than `local`: `local` hard-codes the H2 queue and repository
+    # (LocalCommand#propertiesOverrides), so it cannot be pointed at postgres.
+    command: server standalone
+    user: root
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["postgres"]
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: k3str4
+        kestra:
+          repository:
+            type: postgres
+          queue:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          server:
+            basicAuth:
+              enabled: true
+              username: admin@kestra.io
+              password: Admin1234!
+    ports:
+      - "8081:8080"   # Kestra UI and API
+      - "8091:8090"   # the port declared by the trigger in the examples
+    volumes:
+      - ./build/libs:/app/plugins:ro
+      - kestra-postgres-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+
 volumes:
   kestra-data: {}
+  kestra-postgres-data: {}
+  postgres-data: {}

@@ -1,0 +1,46 @@
+# Synchronous (`wait: true`) endpoint: the caller gets the flow's own response envelope back on the
+# same HTTP request, rather than a 202 and an execution id.
+#
+# This is the flow to use when checking the plugin against a non-default queue backend — see the
+# `postgres` profile in docker-compose.yml. Against that stack:
+#
+#   curl -i localhost:8091/api/orders/42
+#     HTTP/1.1 200 OK
+#     X-Trace-Id: <execution id>
+#     {"id":"42","status":"FOUND"}
+#
+#   curl -i localhost:8091/api/orders/0
+#     HTTP/1.1 404 Not Found
+#     {"id":"0","status":"NOT_FOUND"}
+#
+# The 404 case is the interesting one: a flow-produced body is returned verbatim for non-2xx statuses
+# too, which is what makes this usable as a real request/response API.
+id: sync-api
+namespace: company.myapp
+
+tasks:
+  - id: lookup
+    type: io.kestra.plugin.core.log.Log
+    message: "Looking up order {{ trigger.pathParams.id }}"
+
+outputs:
+  - id: response
+    type: JSON
+    value:
+      status: "{{ trigger.pathParams.id == '0' ? 404 : 200 }}"
+      body: |
+        {"id":"{{ trigger.pathParams.id }}","status":"{{ trigger.pathParams.id == '0' ? 'NOT_FOUND' : 'FOUND' }}"}
+      headers:
+        X-Trace-Id: "{{ execution.id }}"
+
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    wait: true
+    waitTimeout: PT30S
+    routes:
+      - method: GET
+        path: /orders/{id}
+        produces: application/json
