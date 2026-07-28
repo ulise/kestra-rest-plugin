@@ -15,6 +15,5 @@ allure-results/
 
 *.log
 .DS_Store
+local-work/
 
-# Local working docs, not part of the plugin
-docs/upstream-discussion.md
