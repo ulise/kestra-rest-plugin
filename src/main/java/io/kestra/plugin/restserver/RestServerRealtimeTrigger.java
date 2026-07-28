@@ -21,6 +21,7 @@ import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.utils.ListUtils;
 import io.micronaut.context.ApplicationContext;
 import io.micronaut.inject.qualifiers.Qualifiers;
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -40,6 +41,7 @@ import reactor.core.publisher.FluxSink;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.io.IOException;
 import java.io.InputStream;
@@ -80,9 +82,10 @@ import java.util.stream.Stream;
         so the flow fully controls the response, including on non-2xx statuses.
 
         Requests that match no route get `404`, and requests violating a route's `consumes` get `415`; neither
-        creates an execution. When `apiKey` is set, requests must present it in the `apiKeyHeader` header or get
-        `401`. The server is bound on the worker that runs the trigger, so the port must be free there and
-        reachable by your callers."""
+        creates an execution. Callers can be authenticated at the edge with an API key (`apiKey`/`apiKeys`) or
+        HTTP Basic (`basicAuth`); a rejected request gets `401` and creates no execution either. The server is
+        bound on the worker that runs the trigger, so the port must be free there and reachable by your
+        callers."""
 )
 @Plugin(
     examples = {
@@ -154,6 +157,37 @@ import java.util.stream.Stream;
                       - method: GET
                         path: /orders/{id}
                         produces: application/json
+                """
+        ),
+        @Example(
+            title = "Authenticate legacy callers with HTTP Basic, answering 403 when the credentials are wrong.",
+            full = true,
+            code = """
+                id: basic-auth-api
+                namespace: company.myapp
+
+                tasks:
+                  - id: handle_request
+                    type: io.kestra.plugin.core.log.Log
+                    # The password never reaches the flow; the matched username does.
+                    message: "Request from {{ trigger.basicAuthUser }}"
+
+                triggers:
+                  - id: rest_server
+                    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+                    port: 8090
+                    basePath: /api
+                    invalidCredentialsStatus: 403
+                    authFailureBody: "{}"
+                    basicAuth:
+                      - username: "{{ secret('PARTNER_A_USER') }}"
+                        password: "{{ secret('PARTNER_A_PASSWORD') }}"
+                      - username: "{{ secret('PARTNER_B_USER') }}"
+                        password: "{{ secret('PARTNER_B_PASSWORD') }}"
+                    routes:
+                      - method: POST
+                        path: /orders
+                        consumes: application/json
                 """
         )
     }
@@ -271,6 +305,46 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     @PluginProperty(secret = true, group = "connection")
     private Property<List<String>> apiKeys;
 
+    @Schema(
+        title = "Accepted HTTP Basic credentials",
+        description = """
+            For callers that authenticate with `Authorization: Basic …` and cannot be asked to switch to an API
+            key. When set (non-empty), a request is authorized if its credentials match any entry; list several
+            pairs to front multiple callers. Combined with `apiKey`/`apiKeys` — a request passes if it satisfies
+            *either* scheme — and, like them, rejection happens before any route matching or execution.
+
+            The scheme token is matched case-insensitively (`Basic`, `basic`), as required by RFC 9110. Unlike
+            the API key, the credentials do **not** reach the flow: `Authorization` is stripped from
+            `{{ trigger.headers }}` and the matched username is exposed as `{{ trigger.basicAuthUser }}`
+            instead, so the caller's password is never written to the execution."""
+    )
+    @PluginProperty(group = "connection")
+    private List<BasicCredential> basicAuth;
+
+    @Schema(
+        title = "Status returned when credentials are present but wrong",
+        description = """
+            Applies when a request carries credentials that parse but do not match — a well-formed
+            `Authorization: Basic …` header, or a present but non-matching API key. Requests with no credentials
+            at all, or with an `Authorization` header that is absent, not `Basic`, or undecodable, always get
+            `401`, because nothing could be compared.
+
+            Defaults to `401`, which is what RFC 9110 prescribes. Set it to `403` only to preserve an existing
+            caller contract that distinguishes the two: it is non-standard, and it tells a caller that its header
+            was well-formed."""
+    )
+    @Builder.Default
+    private Property<Integer> invalidCredentialsStatus = Property.ofValue(401);
+
+    @Schema(
+        title = "Body returned when a request is rejected by authentication",
+        description = """
+            Returned verbatim for both the `401` and the invalid-credentials response, with content type
+            `application/json`. Use it to match an existing caller contract, e.g. `{}`. When null, the plugin's
+            own bodies are used: `{"status":"UNAUTHORIZED"}` and `{"status":"FORBIDDEN"}`."""
+    )
+    private Property<String> authFailureBody;
+
     @Builder.Default
     @Getter(AccessLevel.NONE)
     @ToString.Exclude
@@ -308,9 +382,26 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             }
         }
 
+        // Each accepted pair is reduced to a digest of "user:password", the exact byte sequence a Basic header
+        // decodes to, so a request is checked with one constant-time comparison per credential.
+        List<byte[]> basicDigests = new ArrayList<>();
+        for (BasicCredential credential : ListUtils.emptyOnNull(this.basicAuth)) {
+            String user = runContext.render(credential.getUsername()).as(String.class).orElse(null);
+            String password = runContext.render(credential.getPassword()).as(String.class).orElse(null);
+
+            if (user == null || user.isEmpty() || password == null) {
+                throw new IllegalArgumentException("A 'basicAuth' entry needs a non-empty username and a password");
+            }
+
+            basicDigests.add(sha256(user + ":" + password));
+        }
+
         HandlerConfig config = new HandlerConfig(
             runContext.render(this.authHeader).as(String.class).orElse("X-Api-Key"),
             List.copyOf(validKeys),
+            List.copyOf(basicDigests),
+            runContext.render(this.invalidCredentialsStatus).as(Integer.class).orElse(401),
+            runContext.render(this.authFailureBody).as(String.class).orElse(null),
             runContext.render(this.responseOutput).as(String.class).orElse("response"),
             runContext.render(this.waitTimeout).as(Duration.class).orElse(Duration.ofSeconds(30))
         );
@@ -386,10 +477,24 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         ExecutionAwaiter awaiter
     ) {
         // Authentication runs before route logic, so an unauthenticated caller learns nothing about the routes.
-        if (!config.validKeys().isEmpty() && !authorized(ctx.headerMap(), config.authHeader(), config.validKeys())) {
-            ctx.status(401)
+        BasicCredentials basic = config.basicDigests().isEmpty()
+            ? null
+            : parseBasic(header(ctx.headerMap(), "Authorization"));
+        AuthResult auth = authenticate(ctx.headerMap(), basic, config);
+
+        if (auth != AuthResult.AUTHORIZED) {
+            int status = auth == AuthResult.INVALID ? config.invalidCredentialsStatus() : 401;
+            if (status == 401 && !config.basicDigests().isEmpty()) {
+                // RFC 9110: a 401 must say how to authenticate. Only sent when Basic is configured, so an
+                // API-key-only server keeps answering exactly as before.
+                ctx.header("WWW-Authenticate", "Basic");
+            }
+
+            ctx.status(status)
                 .contentType("application/json")
-                .result(json(Map.of("status", "UNAUTHORIZED")));
+                .result(config.authFailureBody() != null
+                    ? config.authFailureBody()
+                    : json(Map.of("status", auth == AuthResult.INVALID ? "FORBIDDEN" : "UNAUTHORIZED")));
             return;
         }
 
@@ -412,7 +517,8 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 ctx.queryParamMap().entrySet().stream()
                     .collect(Collectors.toMap(Map.Entry::getKey, e -> String.join(",", e.getValue())))
             )
-            .headers(ctx.headerMap())
+            .headers(config.basicDigests().isEmpty() ? ctx.headerMap() : withoutAuthorization(ctx.headerMap()))
+            .basicAuthUser(basic == null ? null : basic.username())
             .contentType(ctx.contentType());
 
         if (ctx.isMultipartFormData()) {
@@ -466,32 +572,150 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     }
 
     /**
-     * Case-insensitive lookup of the API key header, then a constant-time comparison against each accepted key.
-     * HTTP header names are case-insensitive and gateways normalise them, so an exact-case {@code get} could
-     * silently find nothing and read as "no key required" — a fail-open bug this deliberately avoids. The request
-     * is authorized when the presented key matches any accepted key; every candidate is compared (no early exit)
-     * so the number of comparisons does not depend on which key matched.
+     * Outcome of the authentication gate. {@code MISSING} and {@code INVALID} are distinguished so a caller
+     * contract that answers {@code 401} for "no usable credentials" and something else for "wrong credentials"
+     * can be preserved; see {@code invalidCredentialsStatus}.
      */
-    static boolean authorized(Map<String, String> headers, String headerName, Collection<String> expectedKeys) {
-        String provided = null;
+    enum AuthResult {
+        AUTHORIZED,
+        MISSING,
+        INVALID
+    }
+
+    /**
+     * Runs every configured scheme and combines them with OR: a request passes if it satisfies the API key
+     * <em>or</em> Basic auth, matching how {@code apiKey} and {@code apiKeys} already combine. When none is
+     * configured the gate is open. A failure reports {@code INVALID} only if some scheme actually had
+     * credentials to compare, so an empty-handed request never sees the invalid-credentials status.
+     */
+    static AuthResult authenticate(Map<String, String> headers, BasicCredentials basic, HandlerConfig config) {
+        boolean apiKeyConfigured = !config.validKeys().isEmpty();
+        boolean basicConfigured = !config.basicDigests().isEmpty();
+
+        if (!apiKeyConfigured && !basicConfigured) {
+            return AuthResult.AUTHORIZED;
+        }
+
+        String providedKey = apiKeyConfigured ? header(headers, config.authHeader()) : null;
+
+        if (apiKeyConfigured && providedKey != null && matchesAny(providedKey, config.validKeys())) {
+            return AuthResult.AUTHORIZED;
+        }
+
+        if (basicConfigured && basic != null && matchesAnyDigest(basic.username() + ":" + basic.password(), config.basicDigests())) {
+            return AuthResult.AUTHORIZED;
+        }
+
+        // Something was presented and compared, so the caller is wrong rather than merely absent. A malformed
+        // or non-Basic Authorization header leaves `basic` null and therefore counts as missing, not invalid:
+        // nothing could be compared against it.
+        boolean presented = (apiKeyConfigured && providedKey != null) || (basicConfigured && basic != null);
+
+        return presented ? AuthResult.INVALID : AuthResult.MISSING;
+    }
+
+    /**
+     * Case-insensitive header lookup. HTTP header names are case-insensitive and gateways normalise them, so an
+     * exact-case {@code get} could silently find nothing and read as "no credentials required" — a fail-open bug
+     * this deliberately avoids.
+     */
+    static String header(Map<String, String> headers, String name) {
         for (Map.Entry<String, String> header : headers.entrySet()) {
-            if (header.getKey().equalsIgnoreCase(headerName)) {
-                provided = header.getValue();
-                break;
+            if (header.getKey().equalsIgnoreCase(name)) {
+                return header.getValue();
             }
         }
 
-        if (provided == null) {
-            return false;
+        return null;
+    }
+
+    /**
+     * Parses an {@code Authorization: Basic <base64>} header, returning null when it is absent, uses another
+     * scheme, or cannot be decoded. The scheme token is compared case-insensitively as RFC 9110 requires —
+     * Javalin's own {@code basicAuthCredentials()} matches {@code "Basic "} exactly, which would make a caller
+     * sending {@code basic} look like it presented nothing at all.
+     * <p>
+     * The credentials are decoded as UTF-8 per RFC 7617. A legacy client that encodes a non-ASCII password as
+     * ISO-8859-1 will therefore not match; ASCII credentials, the overwhelmingly common case, are unaffected.
+     */
+    static BasicCredentials parseBasic(String headerValue) {
+        if (headerValue == null) {
+            return null;
         }
 
-        byte[] providedBytes = provided.getBytes(StandardCharsets.UTF_8);
+        String value = headerValue.strip();
+        int space = value.indexOf(' ');
+        if (space < 0 || !value.substring(0, space).equalsIgnoreCase("Basic")) {
+            return null;
+        }
+
+        byte[] decoded;
+        try {
+            decoded = Base64.getDecoder().decode(value.substring(space + 1).strip());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+
+        String credentials = new String(decoded, StandardCharsets.UTF_8);
+        int colon = credentials.indexOf(':');
+        if (colon < 0) {
+            return null;
+        }
+
+        // Only the first colon separates: RFC 7617 forbids one in the username but allows it in the password.
+        return new BasicCredentials(credentials.substring(0, colon), credentials.substring(colon + 1));
+    }
+
+    /**
+     * Returns the headers without {@code Authorization}, so Basic credentials never reach the flow. They would
+     * otherwise be persisted in the execution's trigger variables — and base64 is not encryption, so the
+     * caller's password would be readable by anyone with execution read access.
+     */
+    static Map<String, String> withoutAuthorization(Map<String, String> headers) {
+        Map<String, String> filtered = new LinkedHashMap<>(headers);
+        filtered.keySet().removeIf(name -> name.equalsIgnoreCase("Authorization"));
+
+        return filtered;
+    }
+
+    /**
+     * Constant-time membership test. Every candidate is compared (no early exit) so the number of comparisons
+     * does not depend on which one matched, and both sides are hashed first so a mismatch in length is not
+     * distinguishable from a mismatch in content.
+     */
+    private static boolean matchesAny(String provided, Collection<String> expected) {
+        byte[] digest = sha256(provided);
         boolean match = false;
-        for (String expected : expectedKeys) {
-            match |= MessageDigest.isEqual(providedBytes, expected.getBytes(StandardCharsets.UTF_8));
+        for (String candidate : expected) {
+            match |= MessageDigest.isEqual(digest, sha256(candidate));
         }
 
         return match;
+    }
+
+    private static boolean matchesAnyDigest(String provided, Collection<byte[]> expectedDigests) {
+        byte[] digest = sha256(provided);
+        boolean match = false;
+        for (byte[] candidate : expectedDigests) {
+            match |= MessageDigest.isEqual(digest, candidate);
+        }
+
+        return match;
+    }
+
+    private static byte[] sha256(String value) {
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is mandated by the JDK, so this cannot happen on a valid runtime.
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+    }
+
+    /**
+     * Username and password decoded from a Basic {@code Authorization} header.
+     */
+    record BasicCredentials(String username, String password) {
     }
 
     /**
@@ -746,7 +970,15 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     /**
      * Per-request configuration rendered once for the trigger's lifetime.
      */
-    private record HandlerConfig(String authHeader, List<String> validKeys, String responseOutput, Duration waitTimeout) {
+    record HandlerConfig(
+        String authHeader,
+        List<String> validKeys,
+        List<byte[]> basicDigests,
+        int invalidCredentialsStatus,
+        String authFailureBody,
+        String responseOutput,
+        Duration waitTimeout
+    ) {
     }
 
     /**
@@ -843,8 +1075,20 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         )
         private final Map<String, String> queryParams;
 
-        @Schema(title = "Request headers")
+        @Schema(
+            title = "Request headers",
+            description = "`Authorization` is omitted when `basicAuth` is configured, so credentials are not persisted."
+        )
         private final Map<String, String> headers;
+
+        @Schema(
+            title = "Username from the request's Basic credentials",
+            description = """
+                Populated only when `basicAuth` is configured and the request carried a parseable
+                `Authorization: Basic …` header. Use it to map the caller to their data, in place of the
+                `Authorization` header that is stripped from `headers`."""
+        )
+        private final String basicAuthUser;
 
         @Schema(title = "Raw request body, decoded as a string")
         private final String body;

@@ -1,0 +1,43 @@
+# HTTP Basic authentication at the edge, preserving a caller contract that separates
+# "no usable credentials" (401) from "wrong credentials" (403).
+#
+# Rejected requests never create an execution — that is the difference from validating
+# credentials inside the flow. Against the compose stacks:
+#
+#   curl -i localhost:8090/api/orders                             # 401, {}
+#   curl -i -H 'Authorization: Bearer x' localhost:8090/api/orders # 401, {} (nothing to compare)
+#   curl -i -u alice:wrong    localhost:8090/api/orders            # 403, {}
+#   curl -i -u alice:s3cret   localhost:8090/api/orders            # 202, execution created
+#   curl -i -u bob:hunter2    localhost:8090/api/orders            # 202, second caller
+#
+# The credentials are inline here so the example runs as-is; in production source them
+# from `{{ secret('...') }}` or KV.
+id: basic-auth-api
+namespace: company.myapp
+
+tasks:
+  - id: handle_request
+    type: io.kestra.plugin.core.log.Log
+    # The matched username reaches the flow; the password never does, and `Authorization`
+    # is stripped from trigger.headers so it is not persisted in the execution.
+    message: |
+      Caller:  {{ trigger.basicAuthUser }}
+      Path:    {{ trigger.path }}
+      Headers: {{ trigger.headers }}
+
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    invalidCredentialsStatus: 403
+    authFailureBody: "{}"
+    basicAuth:
+      - username: alice
+        password: s3cret
+      - username: bob
+        password: hunter2
+    routes:
+      - method: GET
+        path: /orders
+        produces: application/json

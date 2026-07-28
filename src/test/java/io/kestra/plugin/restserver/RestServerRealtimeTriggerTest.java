@@ -228,24 +228,33 @@ class RestServerRealtimeTriggerTest {
     // -------------------------------------------------------------------------------------------------------------
 
     @Test
-    void authorizedIsCaseInsensitiveOnHeaderNameAndFailsClosed() {
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "s3cret"), "X-Api-Key", List.of("s3cret")), is(true));
+    void apiKeyIsCaseInsensitiveOnHeaderNameAndFailsClosed() {
+        RestServerRealtimeTrigger.HandlerConfig config = apiKeyConfig("s3cret");
+
+        assertThat(authenticate(config, Map.of("X-Api-Key", "s3cret")), is(RestServerRealtimeTrigger.AuthResult.AUTHORIZED));
         // Header names are case-insensitive: a normalised "x-api-key" must still match.
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("x-api-key", "s3cret"), "X-Api-Key", List.of("s3cret")), is(true));
-        // Wrong value is rejected.
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "nope"), "X-Api-Key", List.of("s3cret")), is(false));
+        assertThat(authenticate(config, Map.of("x-api-key", "s3cret")), is(RestServerRealtimeTrigger.AuthResult.AUTHORIZED));
+        // Wrong value is rejected, and is distinguishable from no value at all.
+        assertThat(authenticate(config, Map.of("X-Api-Key", "nope")), is(RestServerRealtimeTrigger.AuthResult.INVALID));
         // Missing header fails closed, never "no key required".
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of(), "X-Api-Key", List.of("s3cret")), is(false));
+        assertThat(authenticate(config, Map.of()), is(RestServerRealtimeTrigger.AuthResult.MISSING));
     }
 
     @Test
-    void authorizedAcceptsAnyKeyInTheList() {
-        List<String> keys = List.of("key-aaa", "key-bbb", "key-ccc");
+    void apiKeyAcceptsAnyKeyInTheList() {
+        RestServerRealtimeTrigger.HandlerConfig config = apiKeyConfig("key-aaa", "key-bbb", "key-ccc");
         // Any listed key is accepted.
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "key-aaa"), "X-Api-Key", keys), is(true));
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "key-ccc"), "X-Api-Key", keys), is(true));
+        assertThat(authenticate(config, Map.of("X-Api-Key", "key-aaa")), is(RestServerRealtimeTrigger.AuthResult.AUTHORIZED));
+        assertThat(authenticate(config, Map.of("X-Api-Key", "key-ccc")), is(RestServerRealtimeTrigger.AuthResult.AUTHORIZED));
         // A key not in the list is rejected.
-        assertThat(RestServerRealtimeTrigger.authorized(Map.of("X-Api-Key", "key-zzz"), "X-Api-Key", keys), is(false));
+        assertThat(authenticate(config, Map.of("X-Api-Key", "key-zzz")), is(RestServerRealtimeTrigger.AuthResult.INVALID));
+    }
+
+    @Test
+    void openGateAuthorizesWhenNoSchemeIsConfigured() {
+        RestServerRealtimeTrigger.HandlerConfig config = apiKeyConfig();
+
+        assertThat(authenticate(config, Map.of()), is(RestServerRealtimeTrigger.AuthResult.AUTHORIZED));
     }
 
     @Test
@@ -299,6 +308,186 @@ class RestServerRealtimeTriggerTest {
                 .findFirst()
                 .orElse(null);
             assertThat(forwarded, is("key-aaa"));
+        });
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // #10 HTTP Basic authentication
+    // -------------------------------------------------------------------------------------------------------------
+
+    @Test
+    void parseBasicAcceptsAnyCaseSchemeAndRejectsWhatCannotBeCompared() {
+        assertThat(RestServerRealtimeTrigger.parseBasic("Basic " + base64("alice:s3cret")),
+            is(new RestServerRealtimeTrigger.BasicCredentials("alice", "s3cret")));
+        // RFC 9110 makes the scheme token case-insensitive; Javalin's own helper matches "Basic " exactly.
+        assertThat(RestServerRealtimeTrigger.parseBasic("basic " + base64("alice:s3cret")),
+            is(new RestServerRealtimeTrigger.BasicCredentials("alice", "s3cret")));
+        assertThat(RestServerRealtimeTrigger.parseBasic("BASIC " + base64("alice:s3cret")),
+            is(new RestServerRealtimeTrigger.BasicCredentials("alice", "s3cret")));
+        // Only the first colon separates, so a password may contain one.
+        assertThat(RestServerRealtimeTrigger.parseBasic("Basic " + base64("alice:pa:ss")),
+            is(new RestServerRealtimeTrigger.BasicCredentials("alice", "pa:ss")));
+        // An empty password is well-formed and must still be compared rather than treated as absent.
+        assertThat(RestServerRealtimeTrigger.parseBasic("Basic " + base64("alice:")),
+            is(new RestServerRealtimeTrigger.BasicCredentials("alice", "")));
+
+        // Nothing that can be compared: absent, another scheme, undecodable, or no colon at all.
+        assertThat(RestServerRealtimeTrigger.parseBasic(null), is(nullValue()));
+        assertThat(RestServerRealtimeTrigger.parseBasic("Bearer " + base64("alice:s3cret")), is(nullValue()));
+        assertThat(RestServerRealtimeTrigger.parseBasic("Basic"), is(nullValue()));
+        assertThat(RestServerRealtimeTrigger.parseBasic("Basic !!!not-base64!!!"), is(nullValue()));
+        assertThat(RestServerRealtimeTrigger.parseBasic("Basic " + base64("no-colon-here")), is(nullValue()));
+    }
+
+    @Test
+    void basicAuthGuardsRequestsBeforeAnyExecution() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = basicAuthTrigger(port, null, credential("alice", "s3cret"));
+
+        withRunningServer(trigger, port, executions -> {
+            // No credentials at all.
+            HttpResponse<String> missing = send(request(port, "/api/orders").GET());
+            assertThat(missing.statusCode(), is(401));
+            // RFC 9110: a 401 has to say how to authenticate.
+            assertThat(missing.headers().firstValue("WWW-Authenticate").orElse(""), is("Basic"));
+
+            // Another scheme, and an undecodable payload, are both "no usable credentials".
+            assertThat(send(request(port, "/api/orders").header("Authorization", "Bearer abc").GET()).statusCode(), is(401));
+            assertThat(send(request(port, "/api/orders").header("Authorization", "Basic !!!").GET()).statusCode(), is(401));
+            // Wrong password, and wrong user, default to 401 as well.
+            assertThat(send(request(port, "/api/orders").header("Authorization", basic("alice", "nope")).GET()).statusCode(), is(401));
+            assertThat(send(request(port, "/api/orders").header("Authorization", basic("mallory", "s3cret")).GET()).statusCode(), is(401));
+
+            // None of the rejected requests started an execution — the whole point of the edge check.
+            assertThat(executions, is(empty()));
+
+            // Correct credentials, with a lower-cased header name and a lower-cased scheme token.
+            assertThat(send(request(port, "/api/orders").header("authorization", "basic " + base64("alice:s3cret")).GET()).statusCode(), is(202));
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+        });
+    }
+
+    @Test
+    void invalidCredentialsStatusSeparatesWrongFromAbsent() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = basicAuthTrigger(port, 403, credential("alice", "s3cret"));
+
+        withRunningServer(trigger, port, executions -> {
+            // Absent or unparseable stays 401: nothing could be compared.
+            assertThat(send(request(port, "/api/orders").GET()).statusCode(), is(401));
+            assertThat(send(request(port, "/api/orders").header("Authorization", "Bearer abc").GET()).statusCode(), is(401));
+            assertThat(send(request(port, "/api/orders").header("Authorization", "Basic !!!").GET()).statusCode(), is(401));
+
+            // Well-formed but wrong is the case that gets the configured status.
+            HttpResponse<String> wrong = send(request(port, "/api/orders").header("Authorization", basic("alice", "nope")).GET());
+            assertThat(wrong.statusCode(), is(403));
+            assertThat(wrong.body(), containsString("\"status\":\"FORBIDDEN\""));
+            // A 403 is not a challenge, so it carries no WWW-Authenticate.
+            assertThat(wrong.headers().firstValue("WWW-Authenticate").isPresent(), is(false));
+
+            assertThat(executions, is(empty()));
+        });
+    }
+
+    @Test
+    void authFailureBodyIsReturnedVerbatimForBothStatuses() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .basicAuth(List.of(credential("alice", "s3cret")))
+            .invalidCredentialsStatus(Property.ofValue(403))
+            .authFailureBody(Property.ofValue("{}"))
+            .routes(List.of(route("GET", "/orders", null, null)))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> missing = send(request(port, "/api/orders").GET());
+            assertThat(missing.statusCode(), is(401));
+            assertThat(missing.body(), is("{}"));
+
+            HttpResponse<String> wrong = send(request(port, "/api/orders").header("Authorization", basic("alice", "nope")).GET());
+            assertThat(wrong.statusCode(), is(403));
+            assertThat(wrong.body(), is("{}"));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void basicAuthStripsCredentialsAndExposesTheMatchedUsername() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = basicAuthTrigger(port, null,
+            credential("alice", "s3cret"), credential("bob", "hunter2"));
+
+        withRunningServer(trigger, port, executions -> {
+            // Two different callers are both accepted from one list.
+            assertThat(send(request(port, "/api/orders").header("Authorization", basic("alice", "s3cret")).GET()).statusCode(), is(202));
+            assertThat(send(request(port, "/api/orders").header("Authorization", basic("bob", "hunter2")).GET()).statusCode(), is(202));
+            // A pair that is not listed is rejected, even though each half exists on its own.
+            assertThat(send(request(port, "/api/orders").header("Authorization", basic("alice", "hunter2")).GET()).statusCode(), is(401));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 2);
+
+            RestServerRealtimeTrigger.Output output = output(executions.getFirst());
+            // The flow learns who called...
+            assertThat(output.getBasicAuthUser(), is("alice"));
+            // ...but the password never reaches the execution, where it would be persisted in the clear.
+            assertThat(output.getHeaders().keySet().stream().anyMatch(k -> k.equalsIgnoreCase("Authorization")), is(false));
+
+            Map<String, Object> vars = (Map<String, Object>) executions.getFirst().getTrigger().getVariables();
+            Map<String, String> headers = (Map<String, String>) vars.get("headers");
+            assertThat(headers.keySet().stream().anyMatch(k -> k.equalsIgnoreCase("Authorization")), is(false));
+            assertThat(vars.get("basicAuthUser"), is("alice"));
+        });
+    }
+
+    @Test
+    void basicAuthAndApiKeyCombineWithOr() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .apiKey(Property.ofValue("s3cret-key"))
+            .basicAuth(List.of(credential("alice", "s3cret")))
+            .routes(List.of(route("GET", "/orders", null, null)))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            // Either scheme on its own is enough.
+            assertThat(send(request(port, "/api/orders").header("X-Api-Key", "s3cret-key").GET()).statusCode(), is(202));
+            assertThat(send(request(port, "/api/orders").header("Authorization", basic("alice", "s3cret")).GET()).statusCode(), is(202));
+            // Neither satisfied.
+            assertThat(send(request(port, "/api/orders").header("X-Api-Key", "nope").GET()).statusCode(), is(401));
+            assertThat(send(request(port, "/api/orders").GET()).statusCode(), is(401));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 2);
+            // With Basic configured, the API-key header is still forwarded — only Authorization is stripped.
+            assertThat(output(executions.getFirst()).getHeaders().entrySet().stream()
+                .anyMatch(e -> e.getKey().equalsIgnoreCase("X-Api-Key")), is(true));
+        });
+    }
+
+    @Test
+    void headersReachTheFlowUnchangedWhenBasicAuthIsNotConfigured() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("GET", "/orders", null, null));
+
+        withRunningServer(trigger, port, executions -> {
+            // Without basicAuth the trigger must not start filtering headers it never used to touch.
+            assertThat(send(request(port, "/api/orders").header("Authorization", "Bearer opaque-token").GET()).statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            RestServerRealtimeTrigger.Output output = output(executions.getFirst());
+            assertThat(output.getHeaders().entrySet().stream()
+                .filter(e -> e.getKey().equalsIgnoreCase("Authorization"))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(null), is("Bearer opaque-token"));
+            assertThat(output.getBasicAuthUser(), is(nullValue()));
         });
     }
 
@@ -609,6 +798,7 @@ class RestServerRealtimeTriggerTest {
             .pathParams((Map<String, String>) variables.get("pathParams"))
             .queryParams((Map<String, String>) variables.get("queryParams"))
             .headers((Map<String, String>) variables.get("headers"))
+            .basicAuthUser((String) variables.get("basicAuthUser"))
             .body((String) variables.get("body"))
             .contentType((String) variables.get("contentType"))
             .build();
@@ -622,6 +812,54 @@ class RestServerRealtimeTriggerTest {
             .basePath(Property.ofValue(basePath))
             .routes(List.of(routes))
             .build();
+    }
+
+    private static RestServerRealtimeTrigger basicAuthTrigger(int port, Integer invalidStatus, BasicCredential... credentials) {
+        RestServerRealtimeTrigger.RestServerRealtimeTriggerBuilder<?, ?> builder = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .basicAuth(List.of(credentials))
+            .routes(List.of(route("GET", "/orders", null, null)));
+
+        if (invalidStatus != null) {
+            builder.invalidCredentialsStatus(Property.ofValue(invalidStatus));
+        }
+
+        return builder.build();
+    }
+
+    private static BasicCredential credential(String username, String password) {
+        return BasicCredential.builder()
+            .username(Property.ofValue(username))
+            .password(Property.ofValue(password))
+            .build();
+    }
+
+    /** Mirrors what {@code handle()} does: parse the header only when Basic is configured, then run the gate. */
+    private static RestServerRealtimeTrigger.AuthResult authenticate(
+        RestServerRealtimeTrigger.HandlerConfig config,
+        Map<String, String> headers
+    ) {
+        RestServerRealtimeTrigger.BasicCredentials basic = config.basicDigests().isEmpty()
+            ? null
+            : RestServerRealtimeTrigger.parseBasic(RestServerRealtimeTrigger.header(headers, "Authorization"));
+
+        return RestServerRealtimeTrigger.authenticate(headers, basic, config);
+    }
+
+    private static RestServerRealtimeTrigger.HandlerConfig apiKeyConfig(String... keys) {
+        return new RestServerRealtimeTrigger.HandlerConfig(
+            "X-Api-Key", List.of(keys), List.of(), 401, null, "response", Duration.ofSeconds(30));
+    }
+
+    private static String basic(String username, String password) {
+        return "Basic " + base64(username + ":" + password);
+    }
+
+    private static String base64(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
     }
 
     private static RouteDefinition route(String method, String path, String consumes, String produces) {

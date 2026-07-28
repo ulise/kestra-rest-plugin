@@ -86,6 +86,9 @@ Content-Type: application/json
 | `authHeader`     | `String`      | `X-Api-Key` | Header carrying the API key (case-insensitive lookup).            |
 | `apiKey`         | `String`      | _(none)_    | Expected API key; when set, requests without it get `401`. Empty/null disables auth. Store it as a secret. |
 | `apiKeys`        | `List<String>`| _(none)_    | Accepted keys for multiple callers; a request passes if its key matches `apiKey` or any entry. The matched key still reaches the flow. Store as secrets. |
+| `basicAuth`      | `List<Credential>` | _(none)_ | Accepted HTTP Basic `{username, password}` pairs (see [HTTP Basic](#http-basic)). Store as secrets. |
+| `invalidCredentialsStatus` | `Integer` | `401`   | Status when credentials are present but wrong; set `403` to keep a caller contract that separates the two. |
+| `authFailureBody`| `String`      | _(none)_    | Body returned verbatim on an authentication failure, e.g. `{}`. Defaults to the plugin's own JSON. |
 | `maxRequestSize` | `Long`        | `10485760`  | Maximum request size in bytes (incl. multipart uploads). Defaults to 10 MB. |
 
 Each route takes `method` (required), `path` (required), `consumes`, `produces`, an optional `wait`
@@ -101,7 +104,8 @@ All of these are Kestra properties, so they accept Pebble expressions.
 | `trigger.matchedRoute` | `String`              | Route pattern, e.g. `/api/orders/{id}`.        |
 | `trigger.pathParams`   | `Map<String, String>` | Parameters extracted from the URL.             |
 | `trigger.queryParams`  | `Map<String, String>` | Repeated parameters are joined with a comma.   |
-| `trigger.headers`      | `Map<String, String>` | Request headers.                               |
+| `trigger.headers`      | `Map<String, String>` | Request headers. `Authorization` is omitted when `basicAuth` is set. |
+| `trigger.basicAuthUser`| `String`              | Username from the request's Basic credentials; only when `basicAuth` is set. |
 | `trigger.body`         | `String`              | Raw body, decoded as a string (non-multipart).  |
 | `trigger.bodyBase64`   | `String`              | Raw body base64-encoded; only when the route sets `base64Body: true`. |
 | `trigger.parts`        | `List<Part>`          | Uploaded file parts of a multipart request; each `Part` is `{name, filename, contentType, size, content}` with `content` base64. |
@@ -191,8 +195,9 @@ drops in-flight waiting requests, which a synchronous caller sees as a dropped c
 Set `apiKey` (from a secret) to require an API key. Requests missing it, or presenting the wrong value in
 the `authHeader` header (default `X-Api-Key`), are rejected with `401` before any route matching or
 execution. The header lookup is **case-insensitive**, so a gateway that normalises header casing cannot
-cause a fail-open. Leaving both `apiKey` and `apiKeys` empty or unset disables the check. For per-caller
-auth beyond a shared key, or TLS, keep the port behind a reverse proxy.
+cause a fail-open. Leaving both `apiKey` and `apiKeys` empty or unset disables the check. For callers that
+send `Authorization: Basic …` instead, see [HTTP Basic](#http-basic). For TLS, keep the port behind a
+reverse proxy.
 
 **Multiple callers.** To front several partners that each present their own key, list the accepted keys in
 `apiKeys` (combined with `apiKey`); a request passes if its key matches any of them. The **matched key is
@@ -214,9 +219,62 @@ triggers:
         produces: application/json
 ```
 
-If you prefer the flow to own auth entirely (arbitrary key-to-partner logic, custom `401` bodies), leave
-both `apiKey` and `apiKeys` unset and validate `{{ trigger.headers['X-Api-Key'] }}` in the flow, returning
-a flow-controlled `401` via `responseOutput` (requires `wait: true`).
+### HTTP Basic
+
+For callers that authenticate with `Authorization: Basic …` and cannot be asked to switch, list the accepted
+pairs in `basicAuth`. It combines with `apiKey`/`apiKeys` — a request passes if it satisfies **either** scheme —
+and, like them, rejects before any route matching or execution:
+
+```yaml
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    invalidCredentialsStatus: 403   # default 401
+    authFailureBody: "{}"           # default {"status":"UNAUTHORIZED"} / {"status":"FORBIDDEN"}
+    basicAuth:
+      - username: "{{ secret('PARTNER_A_USER') }}"
+        password: "{{ secret('PARTNER_A_PASSWORD') }}"
+      - username: "{{ secret('PARTNER_B_USER') }}"
+        password: "{{ secret('PARTNER_B_PASSWORD') }}"
+    routes:
+      - method: POST
+        path: /orders
+```
+
+**The password never reaches the flow.** Unlike the API key, which is deliberately forwarded, `Authorization`
+is stripped from `{{ trigger.headers }}` and the matched username is exposed as `{{ trigger.basicAuthUser }}`
+instead. This matters because trigger variables are persisted in the execution — into the queue table, the
+execution repository, and the Kestra UI — and `Basic` is base64, not encryption, so a forwarded header would
+put the caller's password in front of anyone with execution read access. Note that Kestra's
+`@PluginProperty(secret = true)` is documentation metadata for UI masking, not runtime redaction, so it would
+not have prevented this.
+
+**`401` vs `403`.** By default every rejection is `401`, as RFC 9110 prescribes. Set `invalidCredentialsStatus:
+403` to preserve a caller contract that distinguishes the two:
+
+| Request | Status |
+|---|---|
+| No `Authorization` header, another scheme (`Bearer …`), undecodable base64, or no `:` in the decoded value | `401` — nothing could be compared |
+| Well-formed `Basic` credentials that match no configured pair | `invalidCredentialsStatus` |
+
+`401` responses carry `WWW-Authenticate: Basic` when `basicAuth` is configured; `403` responses do not, since a
+`403` is not a challenge. Be aware the challenge header makes a browser pop a native login dialog — harmless for
+machine-to-machine traffic, surprising if someone opens the URL by hand.
+
+The scheme token is matched **case-insensitively** (`Basic`, `basic`, `BASIC`) per RFC 9110, and credentials are
+compared in constant time against every configured pair. Credentials are decoded as UTF-8 per RFC 7617; a legacy
+client that encodes a non-ASCII password as ISO-8859-1 will not match, though ASCII credentials — the
+overwhelmingly common case — are unaffected.
+
+### Letting the flow own authentication
+
+If you prefer the flow to own auth entirely (arbitrary key-to-partner logic, lookups against a database), leave
+`apiKey`, `apiKeys` and `basicAuth` unset and validate `{{ trigger.headers }}` in the flow, returning a
+flow-controlled `401` via `responseOutput` (requires `wait: true`). The cost is that **every request creates an
+execution before it is rejected**, so unauthenticated traffic reaches the executor and shows up in the execution
+list — which is exactly what the edge checks above avoid.
 
 ## Build
 
@@ -299,8 +357,9 @@ be free on that host and reachable by your callers. With several workers, the tr
 one picks it up — put a load balancer in front, or pin it with a `workerGroup`. Two flows cannot share
 a port on the same worker; the second trigger fails to bind.
 
-**Nothing here authenticates callers.** Anyone who can reach the port can start executions. Keep the
-port on an internal network or behind a reverse proxy that handles TLS and authentication.
+**Authentication is opt-in, and there is no TLS.** With `apiKey`, `apiKeys` and `basicAuth` all unset, anyone
+who can reach the port can start executions. Even with them set, credentials cross the wire in the clear, so
+keep the port on an internal network or behind a reverse proxy that terminates TLS.
 
 **Route changes take effect on trigger restart.** Routes are rendered and registered once, when the
 server starts.
@@ -342,5 +401,6 @@ The spec declares `consumes` but its sample handler never reads it. Here a misma
 ## Not implemented
 
 From the spec's "Future Enhancements": TLS termination and a companion response task. Synchronous waiting
-(`wait`), flow-controlled responses (`responseOutput`), and API-key auth (`apiKey`) are now supported — see
+(`wait`), flow-controlled responses (`responseOutput`), API-key auth (`apiKey`) and HTTP Basic auth
+(`basicAuth`) are now supported — see
 the sections above. TLS and per-caller auth are still expected to be handled by a reverse proxy.
