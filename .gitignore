@@ -9,6 +9,7 @@ allure-results/
 *.ipr
 *.iws
 .vscode/
+.claude/
 .classpath
 .project
 .settings/
