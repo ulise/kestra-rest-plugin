@@ -170,8 +170,18 @@ carry different bodies (e.g. `{"status":"NOT_FOUND"}` vs `{"status":"NO_RECEIPT"
 absent, a successful execution returns `200` with its outputs as JSON and a failed one returns `500`. If
 the execution does not finish within `waitTimeout`, the request returns `504` (the execution keeps running).
 
-Synchronous mode observes the in-process execution queue. It is validated on the standalone (`server local`)
-runner; on distributed executor backends its behaviour needs separate verification.
+Synchronous mode requires the trigger's worker and the executor to share a JVM — the case for
+`kestra server local`, `kestra server standalone`, and a single-replica Helm `standalone` deployment. It is
+**queue-backend agnostic**: the trigger subscribes to the execution queue through Kestra's `QueueInterface`,
+so the memory, H2, MySQL and Postgres queues all work. `server local` itself runs on the H2 JDBC queue, so
+the JDBC path is the one already exercised. On JDBC backends the queue is polled rather than dispatched
+in-process, which adds up to `kestra.jdbc.queues.max-poll-interval` (default 500 ms) of latency on an
+otherwise idle instance; lower it if that matters for your endpoint.
+
+Distributed deployments are **not** supported, and the reason is the HTTP server rather than the queue: a
+realtime trigger is evaluated on exactly one worker, so only that worker binds the port. Scaling past one
+replica leaves the other replicas with nothing listening. A worker restart or trigger rebalance likewise
+drops in-flight waiting requests, which a synchronous caller sees as a dropped connection.
 
 ### Authentication
 

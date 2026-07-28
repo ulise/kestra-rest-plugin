@@ -215,8 +215,12 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             (see `responseOutput`). When `false` (the default), requests are answered immediately with
             `202 Accepted` and never wait.
 
-            Synchronous mode observes the in-process execution queue; it is validated on the standalone
-            (`server local`) runner. On distributed executor backends its behaviour needs separate verification."""
+            Synchronous mode requires the trigger's worker and the executor to share a JVM (`server local`,
+            `server standalone`, or a single-replica deployment). It is queue-backend agnostic and works on
+            the memory, H2, MySQL and Postgres queues alike, but on JDBC backends the queue is polled rather
+            than dispatched in-process, adding up to `kestra.jdbc.queues.max-poll-interval` (default 500ms)
+            of latency on an otherwise idle instance. It is not supported when the trigger's worker is a
+            separate process from the executor: only that worker binds the port."""
     )
     @Builder.Default
     private Property<Boolean> wait = Property.ofValue(false);
