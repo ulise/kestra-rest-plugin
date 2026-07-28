@@ -123,7 +123,7 @@ All of these are Kestra properties, so they accept Pebble expressions.
 ```yaml
 routes:
   - method: POST
-    path: /fdl-feedback        # JSON or multipart with result photos
+    path: /feedback            # JSON or multipart with result photos
     produces: application/json
   - method: POST
     path: /images
