@@ -28,6 +28,10 @@ your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jet
 | `1.1.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
 | `1.0.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
 
+`1.4.0` was additionally verified end to end against a running `kestra/kestra:v1.3.28`, installing the
+published artifact rather than a local build: a multipart file part and a `fetchType: STORE` body both read
+back **byte-identical** from the internal storage and were consumed by `io.kestra.plugin.core.storage.Size`.
+
 To build against a different Kestra version, set `kestraVersion` in `gradle.properties` and, if that
 version ships a different Jetty, realign `javalinVersion`/`jettyVersion` as described in the notes below.
 When cutting a new release, add a row here for the versions it was built against.
