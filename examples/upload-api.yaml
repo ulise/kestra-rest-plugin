@@ -12,12 +12,15 @@ namespace: company.myapp
 #     -H 'Content-Type: application/octet-stream' --data-binary @result.jpg
 
 tasks:
+  # A variable the request did not set is absent, not null, and Kestra renders with strict variables — so
+  # every optional one needs a `??` default. `parts` and `formFields` are only set for a multipart request,
+  # `uri` only for a route that stores the body.
   - id: describe_upload
     type: io.kestra.plugin.core.log.Log
     message: |
       ContentType: {{ trigger.contentType }}
-      Parts:       {{ trigger.parts }}
-      FormFields:  {{ trigger.formFields }}
+      Parts:       {{ trigger.parts ?? 'none' }}
+      FormFields:  {{ trigger.formFields ?? 'none' }}
       BodyUri:     {{ trigger.uri ?? 'none' }}
 
   # The URI is a file like any other, so tasks that take one need no decoding step.
