@@ -9,6 +9,8 @@ import io.kestra.core.models.triggers.Trigger;
 import io.kestra.core.queues.QueueFactoryInterface;
 import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.storages.StorageContext;
+import io.kestra.core.storages.StorageInterface;
 import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
@@ -18,7 +20,9 @@ import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.ConnectException;
 import java.net.ServerSocket;
 import java.net.URI;
@@ -42,6 +46,7 @@ import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -59,6 +64,9 @@ class RestServerRealtimeTriggerTest {
     @Inject
     @Named(QueueFactoryInterface.EXECUTION_NAMED)
     private QueueInterface<Execution> executionQueue;
+
+    @Inject
+    private StorageInterface storageInterface;
 
     @Test
     void postFiresExecutionWithBody() throws Exception {
@@ -635,7 +643,7 @@ class RestServerRealtimeTriggerTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void multipartExposesFilePartsIntactAndFormFields() throws Exception {
+    void multipartStoresFilePartsIntactAndExposesFormFields() throws Exception {
         int port = freePort();
         RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/upload", null, null));
 
@@ -653,7 +661,8 @@ class RestServerRealtimeTriggerTest {
             assertThat(response.statusCode(), is(202));
 
             await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
-            Map<String, Object> vars = (Map<String, Object>) executions.getFirst().getTrigger().getVariables();
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
 
             List<Map<String, Object>> parts = (List<Map<String, Object>>) vars.get("parts");
             assertThat(parts, hasSize(1));
@@ -661,11 +670,209 @@ class RestServerRealtimeTriggerTest {
             assertThat(part.get("name"), is("photo"));
             assertThat(part.get("filename"), is("result.jpg"));
             assertThat(part.get("contentType"), is("image/jpeg"));
-            // The bytes round-trip through base64 unchanged — the crux of the issue.
-            assertThat(Base64.getDecoder().decode((String) part.get("content")), is(photo));
+            assertThat(((Number) part.get("size")).longValue(), is((long) photo.length));
+            // No bytes in the execution: the part is reached by URI, and reads back byte-identical.
+            assertThat(part.get("content"), is(nullValue()));
+            URI uri = URI.create((String) part.get("uri"));
+            assertThat(uri.getScheme(), is("kestra"));
+            assertThat(uri.getPath(), allOf(
+                containsString("/executions/" + execution.getId() + "/webhook/0/"),
+                containsString("result.jpg")
+            ));
+            assertThat(read(execution, uri), is(photo));
 
             Map<String, List<String>> formFields = (Map<String, List<String>>) vars.get("formFields");
             assertThat(formFields.get("note").getFirst(), is("hello world"));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void multipartNumbersPartsSharingAFilename() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/upload", null, null));
+
+        String boundary = "----testBoundarySameName";
+        byte[] body = multipartBody(boundary,
+            new PartSpec("photo", "result.jpg", "image/jpeg", "first".getBytes(StandardCharsets.UTF_8)),
+            new PartSpec("photo", "result.jpg", "image/jpeg", "second".getBytes(StandardCharsets.UTF_8)));
+
+        withRunningServer(trigger, port, executions -> {
+            send(request(port, "/api/upload")
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+            List<Map<String, Object>> parts = (List<Map<String, Object>>) vars.get("parts");
+
+            // Same field name and same filename, so only the numbering keeps them apart.
+            assertThat(parts, hasSize(2));
+            assertThat(new String(read(execution, URI.create((String) parts.get(0).get("uri"))), StandardCharsets.UTF_8), is("first"));
+            assertThat(new String(read(execution, URI.create((String) parts.get(1).get("uri"))), StandardCharsets.UTF_8), is("second"));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void multipartKeepsOnlyTheFileNameOfATraversingPart() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/upload", null, null));
+
+        String boundary = "----testBoundaryTraversal";
+        byte[] body = multipartBody(boundary,
+            new PartSpec("photo", "../../evil.jpg", "image/jpeg", "payload".getBytes(StandardCharsets.UTF_8)));
+
+        withRunningServer(trigger, port, executions -> {
+            send(request(port, "/api/upload")
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+            String uri = (String) ((List<Map<String, Object>>) vars.get("parts")).getFirst().get("uri");
+
+            // The part cannot be written outside the execution's own directory.
+            assertThat(uri, containsString("/executions/" + execution.getId() + "/webhook/0/evil.jpg"));
+            assertThat(uri, not(containsString("..")));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void fetchTypeStoreStreamsBinaryBodyToStorage() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api",
+            storeRoute("POST", "/blob"));
+
+        byte[] blob = {0x00, (byte) 0xFF, 0x10, (byte) 0x80, 0x7F, (byte) 0xC3};
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/blob")
+                .header("Content-Type", "application/octet-stream")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(blob)));
+            assertThat(response.statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+
+            // The body never reaches the execution — only the URI it was stored under does.
+            assertThat(vars.get("body"), is(nullValue()));
+            assertThat(vars.get("bodyBase64"), is(nullValue()));
+            URI uri = URI.create((String) vars.get("uri"));
+            assertThat(uri.getPath(), containsString("/executions/" + execution.getId() + "/webhook/body"));
+            assertThat(read(execution, uri), is(blob));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void fetchTypeStoreLeavesNothingBehindForAnEmptyBody() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", storeRoute("POST", "/blob"));
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/blob")
+                .POST(HttpRequest.BodyPublishers.noBody()));
+            assertThat(response.statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+
+            // No URI, and no empty file left in the storage either.
+            assertThat(vars.get("uri"), is(nullValue()));
+            assertThat(storedFiles(execution), is(empty()));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void fetchTypeNoneDropsTheBody() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api",
+            RouteDefinition.builder()
+                .method(Property.ofValue("POST"))
+                .path(Property.ofValue("/ping"))
+                .fetchType(Property.ofValue(FetchType.NONE))
+                .build());
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/ping")
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"item\":\"widget\"}")));
+            assertThat(response.statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+
+            assertThat(vars.get("body"), is(nullValue()));
+            assertThat(vars.get("uri"), is(nullValue()));
+            assertThat(storedFiles(execution), is(empty()));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void routeFetchTypeOverridesTheTriggerDefault() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .fetchType(Property.ofValue(FetchType.STORE))
+            .routes(List.of(
+                route("POST", "/stored", null, null),
+                RouteDefinition.builder()
+                    .method(Property.ofValue("POST"))
+                    .path(Property.ofValue("/fetched"))
+                    .fetchType(Property.ofValue(FetchType.FETCH))
+                    .build()
+            ))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            send(request(port, "/api/stored").POST(HttpRequest.BodyPublishers.ofString("stored payload")));
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+
+            send(request(port, "/api/fetched").POST(HttpRequest.BodyPublishers.ofString("fetched payload")));
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 2);
+
+            // The route without its own fetchType inherits STORE from the trigger; the other one opts back out.
+            Map<String, Object> stored = (Map<String, Object>) executions.get(0).getTrigger().getVariables();
+            assertThat(stored.get("body"), is(nullValue()));
+            assertThat(new String(read(executions.get(0), URI.create((String) stored.get("uri"))), StandardCharsets.UTF_8),
+                is("stored payload"));
+
+            Map<String, Object> fetched = (Map<String, Object>) executions.get(1).getTrigger().getVariables();
+            assertThat(fetched.get("body"), is("fetched payload"));
+            assertThat(fetched.get("uri"), is(nullValue()));
+        });
+    }
+
+    @Test
+    void rejectedRequestStoresNothing() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            .apiKey(Property.ofValue("s3cret"))
+            .routes(List.of(storeRoute("POST", "/blob")))
+            .build();
+
+        withRunningServer(trigger, port, executions -> {
+            // Rejected by the key, and by the content type — neither reaches the body, so neither stores.
+            assertThat(send(request(port, "/api/blob")
+                .POST(HttpRequest.BodyPublishers.ofString("payload"))).statusCode(), is(401));
+
+            await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(2)).until(executions::isEmpty);
         });
     }
 
@@ -721,6 +928,31 @@ class RestServerRealtimeTriggerTest {
     // -----------------------------------------------------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Reads back what the trigger stored for an execution, so a test can assert the bytes round-tripped.
+     */
+    private byte[] read(Execution execution, URI uri) throws IOException {
+        try (InputStream content = storageInterface.get(execution.getTenantId(), execution.getNamespace(), uri)) {
+            return content.readAllBytes();
+        }
+    }
+
+    /**
+     * Everything stored under an execution, used to assert that a request left nothing behind.
+     */
+    private List<URI> storedFiles(Execution execution) throws IOException {
+        URI prefix = StorageContext
+            .forExecution(execution.getTenantId(), execution.getNamespace(), execution.getFlowId(), execution.getId())
+            .getContextStorageURI();
+
+        try {
+            return storageInterface.allByPrefix(execution.getTenantId(), execution.getNamespace(), prefix, false);
+        } catch (FileNotFoundException e) {
+            // Nothing was ever written for this execution, which is exactly what the caller is asserting.
+            return List.of();
+        }
+    }
 
     /**
      * Builds a {@code multipart/form-data} body for the given parts, matching the supplied boundary.
@@ -860,6 +1092,14 @@ class RestServerRealtimeTriggerTest {
 
     private static String base64(String value) {
         return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static RouteDefinition storeRoute(String method, String path) {
+        return RouteDefinition.builder()
+            .method(Property.ofValue(method))
+            .path(Property.ofValue(path))
+            .fetchType(Property.ofValue(FetchType.STORE))
+            .build();
     }
 
     private static RouteDefinition route(String method, String path, String consumes, String produces) {

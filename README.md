@@ -19,6 +19,7 @@ your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jet
 
 | Plugin  | Kestra   | Javalin | Jetty    | Java |
 |---------|----------|---------|----------|------|
+| `1.4.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
 | `1.3.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
 | `1.2.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
 | `1.1.3` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
@@ -30,6 +31,14 @@ your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jet
 To build against a different Kestra version, set `kestraVersion` in `gradle.properties` and, if that
 version ships a different Jetty, realign `javalinVersion`/`jettyVersion` as described in the notes below.
 When cutting a new release, add a row here for the versions it was built against.
+
+### Upgrading to 1.4.0
+
+Uploads are no longer base64-encoded into the execution. **`trigger.parts[].content` is gone**, replaced by
+`trigger.parts[].uri`, a `kestra://` URI pointing at the part in Kestra's internal storage; a flow reading
+`content` fails to render rather than silently seeing nothing. `base64Body`/`trigger.bodyBase64` still work
+and are deprecated in favour of `fetchType: STORE`. See
+[Binary and multipart bodies](#binary-and-multipart-bodies).
 
 ## Usage
 
@@ -82,6 +91,7 @@ Content-Type: application/json
 | `basePath`       | `String`      | `/`         | Prefix prepended to every route.                                  |
 | `routes`         | `List<Route>` | required    | Routes to serve; must not be empty.                               |
 | `wait`           | `Boolean`     | `false`     | Default sync mode for every route (see [Synchronous mode](#synchronous-mode-and-flow-controlled-responses)). |
+| `fetchType`      | `FETCH`\|`STORE`\|`NONE` | `FETCH` | Default handling of the request body for every route (see [Binary and multipart bodies](#binary-and-multipart-bodies)). |
 | `waitTimeout`    | `Duration`    | `PT30S`     | How long a waiting request blocks before returning `504`.         |
 | `responseOutput` | `String`      | `response`  | Flow output whose `{status, body, headers}` shapes the response.  |
 | `authHeader`     | `String`      | `X-Api-Key` | Header carrying the API key (case-insensitive lookup).            |
@@ -92,9 +102,9 @@ Content-Type: application/json
 | `authFailureBody`| `String`      | _(none)_    | Body returned verbatim on an authentication failure, e.g. `{}`. Defaults to the plugin's own JSON. |
 | `maxRequestSize` | `Long`        | `10485760`  | Maximum request size in bytes (incl. multipart uploads). Defaults to 10 MB. |
 
-Each route takes `method` (required), `path` (required), `consumes`, `produces`, an optional `wait`
-that overrides the trigger-level default, and an optional `base64Body` (see [Binary and multipart bodies](#binary-and-multipart-bodies)).
-All of these are Kestra properties, so they accept Pebble expressions.
+Each route takes `method` (required), `path` (required), `consumes`, `produces`, and optional `wait` and
+`fetchType` that override the trigger-level defaults (see [Binary and multipart bodies](#binary-and-multipart-bodies)).
+`base64Body` is still accepted but deprecated. All of these are Kestra properties, so they accept Pebble expressions.
 
 ### Trigger outputs
 
@@ -107,36 +117,69 @@ All of these are Kestra properties, so they accept Pebble expressions.
 | `trigger.queryParams`  | `Map<String, String>` | Repeated parameters are joined with a comma.   |
 | `trigger.headers`      | `Map<String, String>` | Request headers. `Authorization` is omitted when `basicAuth` is set. |
 | `trigger.basicAuthUser`| `String`              | Username from the request's Basic credentials; only when `basicAuth` is set. |
-| `trigger.body`         | `String`              | Raw body, decoded as a string (non-multipart).  |
-| `trigger.bodyBase64`   | `String`              | Raw body base64-encoded; only when the route sets `base64Body: true`. |
-| `trigger.parts`        | `List<Part>`          | Uploaded file parts of a multipart request; each `Part` is `{name, filename, contentType, size, content}` with `content` base64. |
+| `trigger.body`         | `String`              | Raw body, decoded as a string; only for `fetchType: FETCH` (non-multipart). |
+| `trigger.uri`          | `String`              | `kestra://` URI of the stored body; only for `fetchType: STORE`, and only when a body was sent. |
+| `trigger.bodyBase64`   | `String`              | Raw body base64-encoded; only when the route sets the deprecated `base64Body: true`. |
+| `trigger.parts`        | `List<Part>`          | Uploaded file parts of a multipart request; each `Part` is `{name, filename, contentType, size, uri}`, the content stored in Kestra's internal storage. |
 | `trigger.formFields`   | `Map<String,List<String>>` | Non-file form fields of a multipart request. |
 | `trigger.contentType`  | `String`              | `Content-Type` of the request.                 |
 
 ### Binary and multipart bodies
 
-`trigger.body` is a UTF-8 string, which corrupts binary content. Two additions carry bytes safely:
+`trigger.body` is a UTF-8 string, which corrupts binary content. Two things carry bytes safely, and neither
+puts them in the execution record.
 
-- **`multipart/form-data`** is detected automatically. File parts are exposed as `trigger.parts` (each part's
-  `content` is **base64-encoded**, with `name`/`filename`/`contentType`/`size`), and non-file fields as
-  `trigger.formFields`. Decode a part in the flow with `{{ trigger.parts[0].content | base64decode }}` or
-  hand it to a task that accepts base64.
-- **Other binary bodies** (e.g. `application/octet-stream`): set `base64Body: true` on the route to also get
-  `trigger.bodyBase64` (base64 of the raw bytes). This is opt-in so text/JSON routes don't carry a redundant
-  base64 copy in stored executions.
+**`multipart/form-data` is detected automatically.** Every file part is streamed into Kestra's internal
+storage as it arrives and exposed as `trigger.parts` — `{name, filename, contentType, size, uri}` — with the
+non-file fields as `trigger.formFields`. Hand `uri` to any task that takes a file:
 
 ```yaml
-routes:
-  - method: POST
-    path: /feedback            # JSON or multipart with result photos
-    produces: application/json
-  - method: POST
-    path: /images
-    base64Body: true           # binary image body as {{ trigger.bodyBase64 }}
+tasks:
+  - id: store_photo
+    type: io.kestra.plugin.core.storage.Concat
+    files:
+      - "{{ trigger.parts[0].uri }}"
 ```
 
-Uploads are capped by `maxRequestSize` (default 10 MB). base64 inflates payloads ~33% and lands in stored
-execution variables, so keep `maxRequestSize` sized to your real uploads.
+Parts are stored under the execution the request creates (`…/executions/{id}/webhook/{n}/{filename}`) and are
+purged with it. They are numbered because two parts of one request may share a filename, and only the file
+name of a caller-supplied path is kept, so a part called `../../evil.jpg` cannot escape its directory.
+
+**`fetchType` decides what happens to a non-multipart body**, on the trigger or per route:
+
+| `fetchType` | Effect |
+|-------------|--------|
+| `FETCH` (default) | The body reaches the flow as `{{ trigger.body }}`, decoded as a string. Unchanged behaviour. |
+| `STORE` | The body is streamed into the internal storage as it is received, and reached as `{{ trigger.uri }}`. Nothing of it is held in memory or written into the execution. Use it for uploads of any size and for binary bodies. |
+| `NONE` | The body is read off the connection and dropped. |
+
+```yaml
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    fetchType: FETCH             # trigger-wide default
+    routes:
+      - method: POST
+        path: /feedback          # JSON or multipart with result photos
+        produces: application/json
+      - method: POST
+        path: /images
+        fetchType: STORE         # binary image body as {{ trigger.uri }}
+```
+
+A request rejected before its body is read — by authentication or by `consumes` — stores nothing, and a
+request that fails after storing has what it stored deleted, since no execution will exist to be purged.
+
+Uploads are capped by `maxRequestSize` (default 10 MB); parts above 1 MB are buffered to a temporary file by
+Jetty rather than held in the heap.
+
+> **Deprecated: `base64Body`.** Setting it on a route additionally exposes `{{ trigger.bodyBase64 }}`, the
+> base64 of the raw bytes, as releases before 1.4.0 did. It still works when the body is fetched, and is
+> ignored for `fetchType: STORE`/`NONE`. Prefer `STORE`: base64 inflates the payload by a third and puts all
+> of it in the execution record. Note also that Pebble's `| base64decode` returns a UTF-8 `String`, so it
+> round-trips a text body but **corrupts** a binary one — there is no pure-YAML way back to the bytes.
 
 ### Response semantics
 
