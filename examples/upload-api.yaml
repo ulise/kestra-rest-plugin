@@ -1,0 +1,42 @@
+id: upload-api
+namespace: company.myapp
+
+# Two ways of receiving a file, both reaching the flow as a kestra:// URI rather than as bytes in the
+# execution: a multipart upload, whose file parts are always stored, and a raw binary body on a route
+# that asks for it with `fetchType: STORE`.
+#
+#   curl -i -X POST localhost:8090/api/feedback \
+#     -F 'photo=@result.jpg;type=image/jpeg' -F 'note=looks good'
+#
+#   curl -i -X POST localhost:8090/api/images \
+#     -H 'Content-Type: application/octet-stream' --data-binary @result.jpg
+
+tasks:
+  - id: describe_upload
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ContentType: {{ trigger.contentType }}
+      Parts:       {{ trigger.parts }}
+      FormFields:  {{ trigger.formFields }}
+      BodyUri:     {{ trigger.uri ?? 'none' }}
+
+  # The URI is a file like any other, so tasks that take one need no decoding step.
+  - id: measure
+    type: io.kestra.plugin.core.storage.Size
+    uri: "{{ trigger.parts[0].uri ?? trigger.uri }}"
+
+triggers:
+  - id: rest_server
+    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+    port: 8090
+    basePath: /api
+    maxRequestSize: 52428800   # 50 MB
+    routes:
+      # File parts are stored whatever the fetchType says, so this route needs none.
+      - method: POST
+        path: /feedback
+        produces: application/json
+      # A raw binary body is only stored when the route asks for it.
+      - method: POST
+        path: /images
+        fetchType: STORE

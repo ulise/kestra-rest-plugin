@@ -7,9 +7,12 @@ import io.javalin.http.HandlerType;
 import io.javalin.http.UploadedFile;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
+import io.kestra.core.models.Label;
 import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.executions.ExecutionTrigger;
+import io.kestra.core.models.flows.State;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.AbstractTrigger;
 import io.kestra.core.models.triggers.RealtimeTriggerInterface;
@@ -21,6 +24,7 @@ import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.utils.IdUtils;
 import io.kestra.core.utils.ListUtils;
 import io.micronaut.context.ApplicationContext;
 import io.micronaut.inject.qualifiers.Qualifiers;
@@ -45,7 +49,8 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
+import java.io.OutputStream;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
@@ -189,6 +194,36 @@ import java.util.stream.Stream;
                         path: /orders
                         consumes: application/json
                 """
+        ),
+        @Example(
+            title = "Receive file uploads: multipart parts and a raw binary body both reach the flow as files.",
+            full = true,
+            code = """
+                id: upload-api
+                namespace: company.myapp
+
+                tasks:
+                  # Both routes hand the flow a kestra:// URI, so no decoding is needed.
+                  - id: measure
+                    type: io.kestra.plugin.core.storage.Size
+                    uri: "{{ trigger.parts[0].uri ?? trigger.uri }}"
+
+                triggers:
+                  - id: rest_server
+                    type: io.kestra.plugin.restserver.RestServerRealtimeTrigger
+                    port: 8090
+                    basePath: /api
+                    maxRequestSize: 52428800
+                    routes:
+                      # File parts are always stored, whatever the fetchType.
+                      - method: POST
+                        path: /feedback
+                        produces: application/json
+                      # A raw binary body is stored on request.
+                      - method: POST
+                        path: /images
+                        fetchType: STORE
+                """
         )
     }
 )
@@ -209,6 +244,11 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             HandlerType.OPTIONS
         )
         .collect(Collectors.toMap(HandlerType::name, Function.identity()));
+
+    /**
+     * Threshold above which an uploaded part is buffered to disk by Jetty rather than kept in the heap.
+     */
+    private static final long MAX_IN_MEMORY_PART_SIZE = 1024L * 1024;
 
     @Schema(title = "Port the embedded HTTP server listens on")
     @Builder.Default
@@ -240,6 +280,25 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     )
     @Builder.Default
     private Property<Long> maxRequestSize = Property.ofValue(10L * 1024 * 1024);
+
+    @Schema(
+        title = "What to do with the request body",
+        description = """
+            Default for every route unless a route sets its own `fetchType`. One of:
+
+            - `FETCH` (the default): the body reaches the flow as `{{ trigger.body }}`, decoded as a string.
+            - `STORE`: the body is streamed into Kestra's internal storage as it is received, and the flow
+              reaches it as `{{ trigger.uri }}`, a `kestra://` URI that any task taking a file accepts. No
+              part of it is held in memory and none of it travels through the execution record, so this is
+              the mode for large uploads and for binary bodies a string would corrupt.
+            - `NONE`: the body is read off the connection and dropped, for a caller whose payload the flow
+              does not need.
+
+            File parts of a `multipart/form-data` request are stored whatever this says: a file has no useful
+            representation inside an execution. See `{{ trigger.parts }}`."""
+    )
+    @Builder.Default
+    private Property<FetchType> fetchType = Property.ofValue(FetchType.FETCH);
 
     @Schema(
         title = "Wait for the triggered execution and return its result",
@@ -369,7 +428,12 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         String rBasePath = runContext.render(this.basePath).as(String.class).orElse("/");
         boolean rWaitDefault = runContext.render(this.wait).as(Boolean.class).orElse(false);
         long rMaxRequestSize = runContext.render(this.maxRequestSize).as(Long.class).orElse(10L * 1024 * 1024);
-        List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath, rWaitDefault);
+        FetchType rFetchTypeDefault = runContext.render(this.fetchType).as(FetchType.class).orElse(FetchType.FETCH);
+        List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath, rWaitDefault, rFetchTypeDefault);
+
+        // Resolved before the server starts: every route can receive an upload, and an instance that cannot store
+        // one should fail the trigger rather than a caller's request halfway through.
+        RequestStorage storage = RequestStorage.of(runContext, triggerContext);
 
         // The gate accepts any of apiKey plus every apiKeys entry; the matched key still reaches the flow.
         List<String> validKeys = new ArrayList<>();
@@ -422,14 +486,17 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                     config2.http.maxRequestSize = rMaxRequestSize;
                     config2.jetty.multipartConfig.maxFileSize(rMaxRequestSize, SizeUnit.BYTES);
                     config2.jetty.multipartConfig.maxTotalRequestSize(rMaxRequestSize, SizeUnit.BYTES);
+                    // Parts above this spill to a temporary file instead of the heap. Kept small deliberately: a
+                    // part is streamed straight into the internal storage, so holding it in memory first would
+                    // undo the point of storing it.
                     config2.jetty.multipartConfig.maxInMemoryFileSize(
-                        (int) Math.min(rMaxRequestSize, Integer.MAX_VALUE), SizeUnit.BYTES);
+                        (int) Math.min(rMaxRequestSize, MAX_IN_MEMORY_PART_SIZE), SizeUnit.BYTES);
 
                     for (CompiledRoute route : compiledRoutes) {
                         config2.routes.addHttpHandler(
                             route.method(),
                             route.fullPath(),
-                            ctx -> handle(ctx, route, conditionContext, triggerContext, emitter, config, awaiter)
+                            ctx -> handle(ctx, route, conditionContext, triggerContext, emitter, config, awaiter, storage)
                         );
                         logger.info("Registering route {} {}{}", route.method(), route.fullPath(), route.synchronous() ? " (wait)" : "");
                     }
@@ -474,7 +541,8 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         TriggerContext triggerContext,
         FluxSink<Execution> emitter,
         HandlerConfig config,
-        ExecutionAwaiter awaiter
+        ExecutionAwaiter awaiter,
+        RequestStorage storage
     ) {
         // Authentication runs before route logic, so an unauthenticated caller learns nothing about the routes.
         BasicCredentials basic = config.basicDigests().isEmpty()
@@ -521,21 +589,53 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             .basicAuthUser(basic == null ? null : basic.username())
             .contentType(ctx.contentType());
 
-        if (ctx.isMultipartFormData()) {
-            // File bytes would not survive string decoding, so expose the parts (base64) and text fields
-            // instead of the raw multipart envelope.
-            builder.parts(uploadedParts(ctx)).formFields(ctx.formParamMap());
-        } else {
-            builder.body(ctx.body());
-            if (route.base64Body()) {
-                builder.bodyBase64(Base64.getEncoder().encodeToString(ctx.bodyAsBytes()));
+        // Minted before a byte of the body is read, so that whatever the request carries is stored under the
+        // execution it is about to create, and is purged with it.
+        String executionId = IdUtils.create();
+        boolean anythingStored = false;
+        Execution execution;
+
+        try {
+            if (ctx.isMultipartFormData()) {
+                // A file has no useful representation inside an execution, so parts are stored whatever the
+                // route's fetchType says, and the flow reaches them by URI.
+                List<Part> parts = storeParts(ctx, storage, executionId);
+                anythingStored = !parts.isEmpty();
+                builder.parts(parts).formFields(ctx.formParamMap());
+            } else {
+                switch (route.fetchType()) {
+                    case FETCH -> {
+                        builder.body(ctx.body());
+                        if (route.base64Body()) {
+                            builder.bodyBase64(Base64.getEncoder().encodeToString(ctx.bodyAsBytes()));
+                        }
+                    }
+                    case STORE -> {
+                        URI uri = storage.storeBody(executionId, ctx.bodyInputStream());
+                        anythingStored = uri != null;
+                        builder.uri(uri == null ? null : uri.toString());
+                    }
+                    // Read and dropped rather than left unclaimed, so the response is not sent over a
+                    // connection cut short mid-upload.
+                    case NONE -> drain(ctx);
+                }
             }
+
+            Output output = builder.build();
+
+            // Built here rather than in a downstream map() so the caller can be told which execution it started.
+            execution = generateExecution(executionId, output, conditionContext, triggerContext);
+        } catch (Exception e) {
+            // Nothing will ever purge what was stored, since the execution it is scoped to will not exist.
+            if (anythingStored) {
+                storage.deleteStored(executionId);
+            }
+
+            ctx.status(500)
+                .contentType("application/json")
+                .result(json(Map.of("status", "error", "error", e.getMessage() != null ? e.getMessage() : e.toString())));
+            return;
         }
-
-        Output output = builder.build();
-
-        // Built here rather than in a downstream map() so the caller can be told which execution it started.
-        Execution execution = TriggerService.generateRealtimeExecution(this, conditionContext, triggerContext, output);
 
         if (!route.synchronous()) {
             emitter.next(execution);
@@ -794,32 +894,78 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     }
 
     /**
-     * Reads every uploaded file part into a {@link Part} with its bytes base64-encoded, so binary content
-     * (images, etc.) survives the trip through Kestra's string/JSON trigger variables.
+     * Streams every uploaded file part into the internal storage, and describes it as a {@link Part} carrying the
+     * URI it was stored under. The bytes never reach the execution, which is both what keeps a large upload out of
+     * the execution record and what lets a flow hand the part to any task that takes a file.
+     * <p>
+     * Parts are numbered by their position in the request: their filenames are chosen by the caller, and two parts
+     * of one request may well carry the same one.
      */
-    private static List<Part> uploadedParts(Context ctx) {
+    private static List<Part> storeParts(Context ctx, RequestStorage storage, String executionId) throws IOException {
         List<Part> parts = new ArrayList<>();
+        int index = 0;
 
-        ctx.uploadedFileMap().forEach((name, files) -> {
-            for (UploadedFile file : files) {
-                byte[] bytes;
-                try (InputStream in = file.content()) {
-                    bytes = in.readAllBytes();
-                } catch (IOException e) {
-                    throw new UncheckedIOException("Failed to read uploaded part '" + name + "'", e);
+        for (Map.Entry<String, List<UploadedFile>> uploaded : ctx.uploadedFileMap().entrySet()) {
+            for (UploadedFile file : uploaded.getValue()) {
+                URI uri;
+                try (InputStream content = file.content()) {
+                    uri = storage.storePart(executionId, index++, file.filename(), content);
                 }
 
                 parts.add(Part.builder()
-                    .name(name)
+                    .name(uploaded.getKey())
                     .filename(file.filename())
                     .contentType(file.contentType())
                     .size(file.size())
-                    .content(Base64.getEncoder().encodeToString(bytes))
+                    .uri(uri.toString())
                     .build());
             }
-        });
+        }
 
         return parts;
+    }
+
+    /**
+     * Reads the body off the connection and discards it, for a route that does not want it.
+     */
+    private static void drain(Context ctx) throws IOException {
+        try (InputStream body = ctx.bodyInputStream()) {
+            body.transferTo(OutputStream.nullOutputStream());
+        }
+    }
+
+    /**
+     * Builds the execution a request starts, with an id chosen by the caller of this method.
+     * <p>
+     * This mirrors {@link TriggerService#generateRealtimeExecution}, which cannot be used here because it mints the
+     * id itself: the files a request brings with it have to be stored before the output describing them exists, and
+     * they are stored under the execution id, so that id has to be known first.
+     */
+    private Execution generateExecution(
+        String id,
+        Output output,
+        ConditionContext conditionContext,
+        TriggerContext triggerContext
+    ) {
+        ExecutionTrigger executionTrigger = ExecutionTrigger.of(this, output, conditionContext.getRunContext().logFileURI());
+
+        List<Label> labels = new ArrayList<>(ListUtils.emptyOnNull(this.getLabels()));
+        labels.add(new Label(Label.FROM, "trigger"));
+        if (labels.stream().noneMatch(label -> Label.CORRELATION_ID.equals(label.key()))) {
+            labels.add(new Label(Label.CORRELATION_ID, id));
+        }
+
+        return Execution.builder()
+            .id(id)
+            .namespace(triggerContext.getNamespace())
+            .flowId(triggerContext.getFlowId())
+            .tenantId(triggerContext.getTenantId())
+            .flowRevision(conditionContext.getFlow().getRevision())
+            .variables(conditionContext.getFlow().getVariables())
+            .state(new State())
+            .trigger(executionTrigger)
+            .labels(labels)
+            .build();
     }
 
     private boolean matchesConsumes(Context ctx, CompiledRoute route) {
@@ -843,7 +989,12 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         return value.trim().toLowerCase(Locale.ROOT);
     }
 
-    private List<CompiledRoute> compileRoutes(RunContext runContext, String basePath, boolean waitDefault) throws Exception {
+    private List<CompiledRoute> compileRoutes(
+        RunContext runContext,
+        String basePath,
+        boolean waitDefault,
+        FetchType fetchTypeDefault
+    ) throws Exception {
         List<CompiledRoute> compiled = new ArrayList<>(routes.size());
 
         for (RouteDefinition route : routes) {
@@ -860,6 +1011,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 runContext.render(route.getConsumes()).as(String.class).orElse(null),
                 runContext.render(route.getProduces()).as(String.class).orElse("application/json"),
                 runContext.render(route.getWait()).as(Boolean.class).orElse(waitDefault),
+                runContext.render(route.getFetchType()).as(FetchType.class).orElse(fetchTypeDefault),
                 runContext.render(route.getBase64Body()).as(Boolean.class).orElse(false)
             ));
         }
@@ -964,7 +1116,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
      * A route with every property already rendered and validated.
      */
     private record CompiledRoute(HandlerType method, String fullPath, String consumes, String produces,
-                                 boolean synchronous, boolean base64Body) {
+                                 boolean synchronous, FetchType fetchType, boolean base64Body) {
     }
 
     /**
@@ -1090,18 +1242,31 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         )
         private final String basicAuthUser;
 
-        @Schema(title = "Raw request body, decoded as a string")
+        @Schema(
+            title = "Raw request body, decoded as a string",
+            description = "Populated only for a route whose `fetchType` is `FETCH`, and never for a `multipart/form-data` request, whose parts are available as `parts` and `formFields`."
+        )
         private final String body;
 
         @Schema(
             title = "Raw request body, base64-encoded",
-            description = "Populated only when the route sets `base64Body: true`, so binary bodies survive intact."
+            description = "Populated only when the route sets the deprecated `base64Body: true` and fetches the body, so binary bodies survive intact. Prefer `fetchType: STORE` and `uri`."
         )
         private final String bodyBase64;
 
         @Schema(
+            title = "URI of the request body in Kestra's internal storage",
+            description = """
+                Populated only for a route whose `fetchType` is `STORE`, and only when the request carried a
+                body. The body is streamed to the storage as it is received, so a payload of any size reaches
+                the flow intact without travelling through the execution. Hand it to any task that takes a
+                `kestra://` file. It is stored under the execution the request creates, and purged with it."""
+        )
+        private final String uri;
+
+        @Schema(
             title = "Uploaded file parts of a `multipart/form-data` request",
-            description = "Each part's `content` is base64-encoded. Empty for non-multipart requests."
+            description = "Each part's content is stored in Kestra's internal storage and reached by its `uri`. Empty for non-multipart requests."
         )
         private final List<Part> parts;
 
@@ -1128,7 +1293,13 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         @Schema(title = "Size of the part in bytes")
         private final long size;
 
-        @Schema(title = "Part content, base64-encoded")
-        private final String content;
+        @Schema(
+            title = "URI of the part's content in Kestra's internal storage",
+            description = """
+                The part is streamed to the storage as it is received, so its bytes reach the flow intact and
+                without travelling through the execution. Hand it to any task that takes a `kestra://` file. It
+                is stored under the execution the request creates, and purged with it."""
+        )
+        private final String uri;
     }
 }
