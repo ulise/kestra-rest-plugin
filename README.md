@@ -42,7 +42,9 @@ Uploads are no longer base64-encoded into the execution. **`trigger.parts[].cont
 `trigger.parts[].uri`, a `kestra://` URI pointing at the part in Kestra's internal storage; a flow reading
 `content` fails to render rather than silently seeing nothing. `base64Body`/`trigger.bodyBase64` still work
 and are deprecated in favour of `fetchType: STORE`. See
-[Binary and multipart bodies](#binary-and-multipart-bodies).
+[Binary and multipart bodies](#binary-and-multipart-bodies), and
+[Reading a stored part inside a script task](#reading-a-stored-part-inside-a-script-task) if the flow decoded
+`content` in a script — that is the migration path for it.
 
 ## Usage
 
@@ -184,6 +186,63 @@ Jetty rather than held in the heap.
 > ignored for `fetchType: STORE`/`NONE`. Prefer `STORE`: base64 inflates the payload by a third and puts all
 > of it in the execution record. Note also that Pebble's `| base64decode` returns a UTF-8 `String`, so it
 > round-trips a text body but **corrupts** a binary one — there is no pure-YAML way back to the bytes.
+
+### Reading a stored part inside a script task
+
+A stored part is a `kestra://` URI, and any task that takes a file resolves it. A **script** task is the
+exception worth spelling out: the code runs in a subprocess — the Process runner, or a container under the
+Docker runner — which has no access to Kestra's internal storage and cannot dereference the URI itself. The
+bytes have to be handed in, and `inputFiles` is what does it. Kestra fetches each `kestra://` value into the
+task's working directory, where the script just opens it by name.
+
+With a known part, name it directly:
+
+```yaml
+tasks:
+  - id: handle
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      photo.jpg: "{{ trigger.parts[0].uri }}"     # same for a STORE body: {{ trigger.uri }}
+    script: |
+      with open("photo.jpg", "rb") as fh:
+          data = fh.read()
+```
+
+When the part count is decided by the caller, render the map instead. `inputFiles` accepts a **JSON string**,
+which Kestra renders before parsing, so a Pebble loop can build it:
+
+```yaml
+    inputFiles: |
+      { {% for part in trigger.parts | default([]) %}{% if not loop.first %}, {% endif %}"upload-{{ loop.index }}": {{ part.uri | toJson }}{% endfor %} }
+    script: |
+      import json
+      parts = json.loads(r'''{{ (trigger.parts | default([])) | toJson }}''')
+      for index, part in enumerate(parts):
+          with open(f"upload-{index}", "rb") as fh:
+              data = fh.read()
+          # part["filename"], part["contentType"], part["size"] describe these bytes
+```
+
+Four things make that work, and each fails quietly if ignored:
+
+- **The key carries the pairing.** `loop.index` is 0-based, so `upload-<n>` is the part's position in
+  `trigger.parts`, and `enumerate()` over the same list re-derives it. Filter the list on the Python side
+  (skipping a part, say) and the indices still line up only if you keep the original index — filter into
+  `[(i, p) for i, p in enumerate(parts) if …]`, never into a re-indexed list. Get this wrong and images are
+  attributed to the wrong metadata, which no error surfaces.
+- **`| toJson` quotes and escapes the URI** rather than concatenating it, so a caller-chosen filename cannot
+  break out of the JSON string. Kestra renders only the *keys* of `inputFiles` a second time, not the values,
+  so a filename containing `{{ … }}` is inert.
+- **`| default([])` covers every other request.** The same task serves the routes that are not multipart, and
+  there `trigger.parts` is absent; the template then renders `{ }`, an empty map that stages nothing.
+- **Parts stay where they were stored.** Passing `part.uri` on to a subflow is cheaper than copying the bytes
+  through an `outputFile`, and the file lives until the execution is purged.
+
+> ⚠️ **Never write the literal `kestra:` + `//` scheme in the script text — not even in a comment.** Kestra
+> scans the rendered script for internal-storage URIs and calls `URI.create` on every match, so a bare scheme
+> fails the task with `IllegalArgumentException: Expected authority at index 9` before the first line runs.
+> If the trace also shows `Provided N input(s).`, the staging already succeeded and the fault is in the script
+> text, not in `inputFiles`.
 
 ### Response semantics
 
