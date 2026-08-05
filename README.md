@@ -17,16 +17,17 @@ Each plugin release is built and tested against a specific Kestra version. Pick 
 your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jetty (see
 [Javalin 7 instead of 6, and a pinned Jetty](#javalin-7-instead-of-6-and-a-pinned-jetty)).
 
-| Plugin  | Kestra   | Javalin | Jetty    | Java |
-|---------|----------|---------|----------|------|
-| `1.4.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.3.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.2.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.1.3` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.1.2` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.1.1` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.1.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
-| `1.0.0` | `1.3.28` | `7.2.2` | `12.1.8` | 21+  |
+| Plugin  | Kestra   | Javalin | Jetty     | Java |
+|---------|----------|---------|-----------|------|
+| `1.4.1` | `1.3.28` | `7.2.2` | `12.1.10` | 21+  |
+| `1.4.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.3.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.2.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.1.3` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.1.2` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.1.1` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.1.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
+| `1.0.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
 
 `1.4.0` was additionally verified end to end against a running `kestra/kestra:v1.3.28`, installing the
 published artifact rather than a local build: a multipart file part and a `fetchType: STORE` body both read
@@ -499,6 +500,16 @@ Kestra's BOM pins Jetty with a `strictly` constraint, which would downgrade Java
 it the same way. Since Kestra core has no Jetty dependency of its own, `build.gradle` overrides that
 constraint to Javalin's Jetty version. **When bumping `javalinVersion`, update `jettyVersion` to match**
 the `jetty.version` property of the corresponding `io.javalin:javalin-parent` POM.
+
+Since `1.4.1`, `jettyVersion` is deliberately one patch **ahead** of that rule: Javalin 7.2.2 is built
+on Jetty `12.1.8`, and 7.2.2 is the newest Javalin 7 there is, so no Javalin upgrade brings the fix for
+**CVE-2026-10050** along. That CVE is in `jetty-security`'s Digest authentication, which this plugin
+never reaches — authentication is implemented in-plugin, and nothing here wires a `SecurityHandler`,
+`LoginService` or `DigestAuthenticator`. But the shadow jar ships `jetty-security`, so every downstream
+image scan reported a HIGH against the plugin. Staying inside `12.1.x` keeps the mixing safe; the full
+suite passes on `12.1.10`, including the multipart and synchronous-mode tests that cross the
+Javalin/Jetty boundary. Once Javalin publishes a release built on `12.1.10` or later, drop back to
+tracking `javalin-parent`.
 
 ### `consumes` is enforced
 
