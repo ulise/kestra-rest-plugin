@@ -742,6 +742,85 @@ class RestServerRealtimeTriggerTest {
 
     @Test
     @SuppressWarnings("unchecked")
+    void multipartStoresAPartWhoseFilenameNeedsUriEncoding() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/upload", null, null));
+
+        // A space is illegal in a URI path, so building the storage URI used to throw and fail the whole upload.
+        byte[] content = {(byte) 0xFF, (byte) 0xD8, 0x00, (byte) 0x89, 0x7F};
+        String boundary = "----testBoundarySpacedName";
+        byte[] body = multipartBody(boundary,
+            new PartSpec("report", "My Report.pdf", "application/pdf", content));
+
+        withRunningServer(trigger, port, executions -> {
+            HttpResponse<String> response = send(request(port, "/api/upload")
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+            assertThat(response.statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+            Map<String, Object> part = ((List<Map<String, Object>>) vars.get("parts")).getFirst();
+
+            // The flow still sees the name the caller gave, spaces and all.
+            assertThat(part.get("filename"), is("My Report.pdf"));
+
+            URI uri = URI.create((String) part.get("uri"));
+            assertThat(uri.getScheme(), is("kestra"));
+            // Encoded in the URI, decoded in the path the storage resolves it by.
+            assertThat(uri.getRawPath(), containsString("My%20Report.pdf"));
+            assertThat(uri.getPath(), containsString("/webhook/0/My Report.pdf"));
+            assertThat(read(execution, uri), is(content));
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void multipartStoresPartsWhateverTheCallerNamesThem() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = trigger(port, "/api", route("POST", "/upload", null, null));
+
+        // Every one of these is either reserved in a URI or ambiguous with a scheme; a filename is caller-controlled,
+        // so none of them may fail the upload.
+        List<String> names = List.of("Q3 summary (final).csv", "a#b.txt", "a?b.txt", "50%.txt", "a:b.txt", ":lead.txt");
+
+        String boundary = "----testBoundaryAwkwardNames";
+        PartSpec[] specs = names.stream()
+            .map(name -> new PartSpec("file", name, "text/plain", name.getBytes(StandardCharsets.UTF_8)))
+            .toArray(PartSpec[]::new);
+
+        withRunningServer(trigger, port, executions -> {
+            assertThat(send(request(port, "/api/upload")
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(multipartBody(boundary, specs)))).statusCode(), is(202));
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> executions.size() == 1);
+            Execution execution = executions.getFirst();
+            Map<String, Object> vars = (Map<String, Object>) execution.getTrigger().getVariables();
+            List<Map<String, Object>> parts = (List<Map<String, Object>>) vars.get("parts");
+
+            assertThat(parts, hasSize(names.size()));
+            for (int i = 0; i < names.size(); i++) {
+                String name = names.get(i);
+                Map<String, Object> part = parts.get(i);
+
+                // The flow is told the name the caller sent, whatever the storage then makes of it.
+                assertThat(part.get("filename"), is(name));
+
+                URI uri = URI.create((String) part.get("uri"));
+                // Kestra strips colons from a storage path — WindowsUtils.windowsToUnixPath normalises drive
+                // letters and does not distinguish them from a colon anywhere else — so that is the one character
+                // the stored name cannot keep. Everything else survives.
+                assertThat(uri.getPath(), containsString("/webhook/" + i + "/" + name.replace(":", "")));
+                // Whatever it was stored as, the part reads back whole.
+                assertThat(new String(read(execution, uri), StandardCharsets.UTF_8), is(name));
+            }
+        });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
     void fetchTypeStoreStreamsBinaryBodyToStorage() throws Exception {
         int port = freePort();
         RestServerRealtimeTrigger trigger = trigger(port, "/api",

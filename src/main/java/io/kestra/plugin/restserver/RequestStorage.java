@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PushbackInputStream;
 import java.net.URI;
+import java.net.URISyntaxException;
 
 /**
  * Writes what a request carries — its uploaded file parts, and its body when the route stores it — into Kestra's
@@ -83,7 +84,7 @@ class RequestStorage {
             executionUri(executionId),
             WEBHOOK_DIRECTORY,
             index,
-            fileName(filename)
+            encodeSegment(fileName(filename))
         ));
 
         return storage.put(tenantId, namespace, uri, content);
@@ -142,5 +143,26 @@ class RequestStorage {
         String name = filename.substring(Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\')) + 1).strip();
 
         return name.isEmpty() || ".".equals(name) || "..".equals(name) ? BODY_FILE : name;
+    }
+
+    /**
+     * Percent-encodes a file name so it can stand as one segment of the storage URI. The name is chosen by the caller
+     * and may hold characters a URI reserves — a space above all, as in {@code My Report.pdf} — which
+     * {@link URI#create} rejects outright, failing the upload with a {@code 500} rather than storing it.
+     * <p>
+     * The storage resolves a file by {@link URI#getPath()}, which undoes this encoding, so the part is still written
+     * under the name the caller gave it and comes back out under that name too. Kestra's own storage builds its URIs
+     * the same way, through the multi-argument constructor rather than by parsing a string.
+     */
+    private static String encodeSegment(String name) {
+        try {
+            // Encoded as an absolute path rather than bare: a lone segment beginning with, or containing, a colon
+            // would otherwise be read as a URI scheme — "a:b.txt" yields a null path, and ":b.txt" throws.
+            return new URI(null, null, "/" + name, null).getRawPath().substring(1);
+        } catch (URISyntaxException e) {
+            // Unreachable: every character illegal in a path is quoted rather than rejected, and the leading slash
+            // rules out the one shape that is ambiguous. Kept so a future change cannot fail silently.
+            throw new IllegalArgumentException("Unusable file name for a stored part: " + name, e);
+        }
     }
 }
