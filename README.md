@@ -19,6 +19,7 @@ your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jet
 
 | Plugin  | Kestra   | Javalin | Jetty     | Java |
 |---------|----------|---------|-----------|------|
+| `1.4.2` | `1.3.31` | `7.2.2` | `12.1.10` | 21+  |
 | `1.4.1` | `1.3.28` | `7.2.2` | `12.1.10` | 21+  |
 | `1.4.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
 | `1.3.0` | `1.3.28` | `7.2.2` | `12.1.8`  | 21+  |
@@ -150,7 +151,9 @@ tasks:
 
 Parts are stored under the execution the request creates (`…/executions/{id}/webhook/{n}/{filename}`) and are
 purged with it. They are numbered because two parts of one request may share a filename, and only the file
-name of a caller-supplied path is kept, so a part called `../../evil.jpg` cannot escape its directory.
+name of a caller-supplied path is kept, so a part called `../../evil.jpg` cannot escape its directory. A name
+holding characters a URI reserves — a space, as in `My Report.pdf` — is percent-encoded in `uri` and stored
+under the name the caller gave it; `trigger.parts[].filename` always reports that name unencoded.
 
 **`fetchType` decides what happens to a non-multipart body**, on the trigger or per route:
 
