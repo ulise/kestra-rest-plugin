@@ -1,7 +1,7 @@
 package io.kestra.plugin.restserver;
 
+import io.kestra.core.contexts.KestraContext;
 import io.kestra.core.models.triggers.TriggerContext;
-import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.storages.StorageContext;
 import io.kestra.core.storages.StorageInterface;
@@ -55,17 +55,11 @@ class RequestStorage {
      * per request, and eagerly rather than on the first upload, so a misconfigured instance fails the trigger
      * instead of failing one caller's request halfway through.
      */
-    @SuppressWarnings("removal")
     static RequestStorage of(RunContext runContext, TriggerContext triggerContext) {
-        if (!(runContext instanceof DefaultRunContext defaultRunContext)) {
-            throw new IllegalStateException(
-                "The REST server trigger requires the standard Kestra runtime to store request files; got "
-                    + runContext.getClass().getName()
-            );
-        }
-
+        // Kestra 2.0 removed DefaultRunContext#getApplicationContext, so a plugin can no longer reach arbitrary
+        // beans. KestraContext is the supported replacement for the internal storage specifically.
         return new RequestStorage(
-            defaultRunContext.getApplicationContext().getBean(StorageInterface.class),
+            KestraContext.getContext().getStorageInterface(),
             triggerContext.getTenantId(),
             triggerContext.getNamespace(),
             triggerContext.getFlowId(),

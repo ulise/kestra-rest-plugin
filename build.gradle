@@ -14,20 +14,25 @@ plugins {
 }
 
 def isBuildSnapshot = version.toString().endsWith('-SNAPSHOT')
+def isKestraSnapshot = kestraVersion.toString().endsWith('-SNAPSHOT')
 
 repositories {
     mavenLocal()
     mavenCentral()
-    if (isBuildSnapshot) {
+    if (isBuildSnapshot || isKestraSnapshot) {
         maven { url = 'https://central.sonatype.com/repository/maven-snapshots/' }
     }
 }
 
-final targetJavaVersion = JavaVersion.VERSION_21
+// Kestra 2.0 builds on Java 25; its class files cannot be read by an older javac.
+final targetJavaVersion = JavaVersion.VERSION_25
 
 java {
     sourceCompatibility = targetJavaVersion
     targetCompatibility = targetJavaVersion
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(targetJavaVersion.majorVersion)
+    }
 }
 
 group = 'io.kestra.plugin'
@@ -63,6 +68,10 @@ dependencies {
     // kestra — provided by the runtime, must not be bundled into the shadow jar
     annotationProcessor group: 'io.kestra', name: 'processor', version: kestraVersion
     compileOnly group: 'io.kestra', name: 'core', version: kestraVersion
+    // Kestra 2.0 moved the queue factory out of core into its own module.
+    compileOnly group: 'io.kestra', name: 'queue', version: kestraVersion
+    // ExecutionStreamingService streams io.micronaut.http.sse.Event; core does not expose micronaut-http transitively.
+    compileOnly 'io.micronaut:micronaut-http'
 
     // The embedded HTTP server. Bundled, since Kestra does not provide it.
     implementation "io.javalin:javalin:$javalinVersion"
@@ -103,6 +112,7 @@ dependencies {
     // A minimal in-memory Kestra runtime, so tests can actually execute flows.
     testAnnotationProcessor group: 'io.kestra', name: 'processor', version: kestraVersion
     testImplementation group: 'io.kestra', name: 'core', version: kestraVersion
+    testImplementation group: 'io.kestra', name: 'queue', version: kestraVersion
     testImplementation group: 'io.kestra', name: 'tests', version: kestraVersion
     testImplementation group: 'io.kestra', name: 'repository-memory', version: kestraVersion
     testImplementation group: 'io.kestra', name: 'runner-memory', version: kestraVersion
@@ -123,6 +133,8 @@ dependencies {
  **********************************************************************************************************************/
 dependencies {
     testImplementation enforcedPlatform("io.kestra:platform:$kestraVersion")
+    // Kestra's platform BOM pinned allure-bom up to 1.3.x but dropped it in 2.0, so pin it here.
+    testImplementation platform("io.qameta.allure:allure-bom:$allureVersion")
     testImplementation 'io.qameta.allure:allure-junit5'
 }
 

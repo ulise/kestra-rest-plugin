@@ -12,6 +12,7 @@ import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.executions.ExecutionTrigger;
+import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.flows.State;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.AbstractTrigger;
@@ -19,15 +20,14 @@ import io.kestra.core.models.triggers.RealtimeTriggerInterface;
 import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
-import io.kestra.core.queues.QueueFactoryInterface;
-import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.services.ExecutionStreamingService;
 import io.kestra.core.utils.IdUtils;
 import io.kestra.core.utils.ListUtils;
 import io.micronaut.context.ApplicationContext;
-import io.micronaut.inject.qualifiers.Qualifiers;
+import io.micronaut.http.sse.Event;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
@@ -40,9 +40,11 @@ import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -656,7 +658,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         }
 
         // Synchronous mode: register interest before emitting, so a fast completion cannot be missed.
-        CompletableFuture<Execution> completion = awaiter.register(execution.getId());
+        CompletableFuture<Execution> completion = awaiter.register(execution.getId(), flowOf(conditionContext));
         emitter.next(execution);
 
         try {
@@ -1185,15 +1187,39 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     }
 
     /**
-     * Awaits terminal executions by observing the execution queue, and hands each waiting request the execution it
-     * started. One subscription is shared for the trigger lifetime; requests register by execution id.
+     * {@link ConditionContext} carries the flow as a {@link io.kestra.core.models.flows.FlowInterface}, while
+     * {@link ExecutionStreamingService} wants the concrete {@link Flow}. Under the scheduler the two are always
+     * the same object, so narrow it here and fail loudly rather than silently if that ever stops holding.
+     */
+    private static Flow flowOf(ConditionContext conditionContext) {
+        if (conditionContext.getFlow() instanceof Flow flow) {
+            return flow;
+        }
+
+        throw new IllegalStateException(
+            "Synchronous 'wait' mode needs a concrete flow; got " + conditionContext.getFlow().getClass().getName()
+        );
+    }
+
+    /**
+     * Awaits terminal executions and hands each waiting request the execution it started.
+     * <p>
+     * Kestra 2.0 removed the named {@code EXECUTION_NAMED} queue bean that earlier versions let a plugin tail
+     * read-only; the execution queue is now a competing-consumer {@code DispatchQueueInterface}, and subscribing
+     * to it from here would steal messages from the Executor. {@link ExecutionStreamingService} is core's
+     * supported way to observe a single execution to completion — it is what the webserver's own
+     * {@code ?wait=true} endpoint uses, and it already handles the race where an execution terminates between
+     * the emit and the registration.
      */
     static final class ExecutionAwaiter implements AutoCloseable {
 
-        private final Map<String, CompletableFuture<Execution>> pending = new ConcurrentHashMap<>();
-        private final AtomicReference<Runnable> unsubscribe = new AtomicReference<>();
+        private final ExecutionStreamingService streamingService;
+        private final Map<String, Disposable> pending = new ConcurrentHashMap<>();
 
-        @SuppressWarnings({"unchecked", "removal"})
+        private ExecutionAwaiter(ExecutionStreamingService streamingService) {
+            this.streamingService = streamingService;
+        }
+
         static ExecutionAwaiter open(RunContext runContext) {
             if (!(runContext instanceof DefaultRunContext defaultRunContext)) {
                 throw new IllegalStateException(
@@ -1201,51 +1227,75 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 );
             }
 
-            ApplicationContext applicationContext = defaultRunContext.getApplicationContext();
-            QueueInterface<Execution> executionQueue = applicationContext.getBean(
-                QueueInterface.class,
-                Qualifiers.byName(QueueFactoryInterface.EXECUTION_NAMED)
-            );
-
-            ExecutionAwaiter awaiter = new ExecutionAwaiter();
-            awaiter.unsubscribe.set(executionQueue.receive(either -> {
-                if (either != null && either.isLeft()) {
-                    awaiter.onExecution(either.getLeft());
-                }
-            }));
-
-            return awaiter;
+            return new ExecutionAwaiter(applicationContextOf(defaultRunContext).getBean(ExecutionStreamingService.class));
         }
 
-        CompletableFuture<Execution> register(String executionId) {
+        /**
+         * STOPGAP. Kestra 1.x let a plugin reach beans through {@code DefaultRunContext#getApplicationContext()};
+         * 2.0 removed that accessor without offering a plugin-facing replacement for anything but the internal
+         * storage ({@link io.kestra.core.contexts.KestraContext}). Sync mode needs {@link ExecutionStreamingService},
+         * so read the field it still holds.
+         * <p>
+         * This is the one place in the plugin that touches Kestra internals, deliberately, so that restoring a
+         * supported lookup is a one-method change once upstream exposes one. Tracked upstream: TODO(issue).
+         */
+        private static ApplicationContext applicationContextOf(DefaultRunContext runContext) {
+            try {
+                Field field = DefaultRunContext.class.getDeclaredField("applicationContext");
+                field.setAccessible(true);
+
+                ApplicationContext applicationContext = (ApplicationContext) field.get(runContext);
+                if (applicationContext == null) {
+                    throw new IllegalStateException("the run context has no application context yet");
+                }
+
+                return applicationContext;
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                throw new IllegalStateException(
+                    "Synchronous 'wait' mode could not reach the Kestra application context. This plugin reads a "
+                        + "private field of DefaultRunContext because Kestra 2.0 exposes no supported alternative; "
+                        + "a core change may have broken it. Use asynchronous routes until the plugin is updated.",
+                    e
+                );
+            }
+        }
+
+        /**
+         * @param flow the flow the execution belongs to; the streaming service needs it to decide when an
+         *             execution counts as terminated (a paused or breakpointed flow is not "done").
+         */
+        CompletableFuture<Execution> register(String executionId, Flow flow) {
             CompletableFuture<Execution> completion = new CompletableFuture<>();
-            pending.put(executionId, completion);
+            String subscriberId = IdUtils.create();
+
+            Disposable subscription = Flux.<Event<Execution>>create(
+                    sink -> streamingService.registerSubscriber(executionId, subscriberId, sink, flow)
+                )
+                .doFinally(signal -> streamingService.unregisterSubscriber(executionId, subscriberId))
+                .last()
+                .subscribe(
+                    event -> completion.complete(event.getData()),
+                    completion::completeExceptionally
+                );
+
+            pending.put(executionId, subscription);
+            // Registered after the put, so a subscription that already terminated (the streaming service can
+            // complete synchronously) still clears its entry instead of leaking it until close().
+            completion.whenComplete((execution, throwable) -> pending.remove(executionId));
 
             return completion;
         }
 
         void cancel(String executionId) {
-            pending.remove(executionId);
-        }
-
-        void onExecution(Execution execution) {
-            if (execution == null || execution.getState() == null || !execution.getState().isTerminated()) {
-                return;
-            }
-
-            CompletableFuture<Execution> completion = pending.remove(execution.getId());
-            if (completion != null) {
-                completion.complete(execution);
+            Disposable subscription = pending.remove(executionId);
+            if (subscription != null) {
+                subscription.dispose();
             }
         }
 
         @Override
         public void close() {
-            Runnable runnable = unsubscribe.getAndSet(null);
-            if (runnable != null) {
-                runnable.run();
-            }
-            pending.values().forEach(completion -> completion.cancel(true));
+            pending.values().forEach(Disposable::dispose);
             pending.clear();
         }
     }

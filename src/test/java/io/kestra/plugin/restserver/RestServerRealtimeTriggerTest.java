@@ -8,15 +8,16 @@ import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.flows.State;
 import io.kestra.core.models.property.Property;
-import io.kestra.core.models.triggers.Trigger;
-import io.kestra.core.queues.QueueFactoryInterface;
-import io.kestra.core.queues.QueueInterface;
+import io.kestra.core.runners.ExecutionEventType;
+import io.kestra.core.queues.BroadcastQueueInterface;
+import io.kestra.core.repositories.ExecutionRepositoryInterface;
+import io.kestra.core.runners.FollowExecutionEvent;
 import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.scheduler.model.TriggerState;
 import io.kestra.core.storages.StorageContext;
 import io.kestra.core.storages.StorageInterface;
 import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
-import jakarta.inject.Named;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import reactor.core.Disposable;
@@ -65,9 +66,13 @@ class RestServerRealtimeTriggerTest {
     @Inject
     private RunContextFactory runContextFactory;
 
+    // Kestra 2.0: ExecutionStreamingService observes the follow queue and reads the execution back from the
+    // repository, so a test that completes an execution out of band has to do both.
     @Inject
-    @Named(QueueFactoryInterface.EXECUTION_NAMED)
-    private QueueInterface<Execution> executionQueue;
+    private BroadcastQueueInterface<FollowExecutionEvent> followExecutionQueue;
+
+    @Inject
+    private ExecutionRepositoryInterface executionRepository;
 
     @Inject
     private StorageInterface storageInterface;
@@ -218,11 +223,11 @@ class RestServerRealtimeTriggerTest {
         int port = freePort();
         RestServerRealtimeTrigger trigger = trigger(port, "/api", route("BEFORE", "/orders", null, null));
 
-        Map.Entry<ConditionContext, Trigger> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
+        Map.Entry<ConditionContext, TriggerState> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
 
         IllegalArgumentException exception = assertThrows(
             IllegalArgumentException.class,
-            () -> trigger.evaluate(mock.getKey(), mock.getValue())
+            () -> trigger.evaluate(mock.getKey(), mock.getValue().context())
         );
         assertThat(exception.getMessage(), containsString("Unsupported HTTP method"));
     }
@@ -240,9 +245,9 @@ class RestServerRealtimeTriggerTest {
             .routes(List.of(route("GET", "/orders", null, null)))
             .build();
 
-        Map.Entry<ConditionContext, Trigger> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
+        Map.Entry<ConditionContext, TriggerState> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
 
-        assertThrows(Exception.class, () -> trigger.evaluate(mock.getKey(), mock.getValue()));
+        assertThrows(Exception.class, () -> trigger.evaluate(mock.getKey(), mock.getValue().context()));
 
         // Nothing bound the port, so the failure is total rather than a server answering without authentication.
         assertThrows(ConnectException.class, () -> CLIENT.send(
@@ -616,24 +621,11 @@ class RestServerRealtimeTriggerTest {
     // #1 Synchronous wait mode
     // -------------------------------------------------------------------------------------------------------------
 
-    @Test
-    void awaiterCompletesOnlyOnTerminalMatchingExecution() throws Exception {
-        RestServerRealtimeTrigger.ExecutionAwaiter awaiter = new RestServerRealtimeTrigger.ExecutionAwaiter();
-        CompletableFuture<Execution> pending = awaiter.register("exec-1");
-
-        // A non-terminal state for the same id must not complete the request.
-        awaiter.onExecution(Execution.builder().id("exec-1").state(new State(State.Type.RUNNING)).build());
-        assertThat(pending.isDone(), is(false));
-
-        // A terminal state for a different id must not complete it either.
-        awaiter.onExecution(Execution.builder().id("other").state(new State(State.Type.SUCCESS)).build());
-        assertThat(pending.isDone(), is(false));
-
-        // Terminal + matching id completes with that execution.
-        awaiter.onExecution(Execution.builder().id("exec-1").state(new State(State.Type.SUCCESS)).build());
-        assertThat(pending.isDone(), is(true));
-        assertThat(pending.get().getId(), is("exec-1"));
-    }
+    // Kestra 2.0 removed the unit test that drove ExecutionAwaiter.onExecution directly. The rules it asserted —
+    // complete only on a terminal state, and only for the matching execution id — are no longer the plugin's to
+    // implement: ExecutionStreamingService decides them, and it is reached only through a live application
+    // context. What is left of the plugin's own behaviour (register before emit, time out, map the response) is
+    // covered by the two integration tests below.
 
     @Test
     void syncModeReturnsFlowControlledResponse() throws Exception {
@@ -667,7 +659,8 @@ class RestServerRealtimeTriggerTest {
                     "body", "{\"status\":\"NOT_FOUND\"}",
                     "headers", Map.of("X-Trace-Id", "abc")
                 )));
-            executionQueue.emit(terminal);
+            executionRepository.save(terminal);
+            followExecutionQueue.emit(new FollowExecutionEvent(terminal, ExecutionEventType.TERMINATED));
 
             HttpResponse<String> response = pending.get(20, TimeUnit.SECONDS);
             assertThat(response.statusCode(), is(404));
@@ -1145,9 +1138,9 @@ class RestServerRealtimeTriggerTest {
      * {@code evaluate()} blocks its thread for the lifetime of the server, so it has to run off the test thread.
      */
     private Disposable subscribe(RestServerRealtimeTrigger trigger, List<Execution> executions) throws Exception {
-        Map.Entry<ConditionContext, Trigger> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
+        Map.Entry<ConditionContext, TriggerState> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
 
-        return Flux.from(trigger.evaluate(mock.getKey(), mock.getValue()))
+        return Flux.from(trigger.evaluate(mock.getKey(), mock.getValue().context()))
             .subscribeOn(Schedulers.boundedElastic())
             .subscribe(executions::add);
     }
