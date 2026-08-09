@@ -420,26 +420,28 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     public Publisher<Execution> evaluate(ConditionContext conditionContext, TriggerContext triggerContext) throws Exception {
         RunContext runContext = conditionContext.getRunContext();
         Logger logger = runContext.logger();
+        StartupProperties startup = new StartupProperties(logger, triggerContext.getTriggerId());
 
         // Rendered once, before the server starts: configuration is fixed for the lifetime of the trigger, and a
         // rendering error should fail the trigger rather than an individual request.
-        int rPort = runContext.render(this.port).as(Integer.class).orElse(8080);
-        String rHost = runContext.render(this.host).as(String.class).orElse("0.0.0.0");
-        String rBasePath = runContext.render(this.basePath).as(String.class).orElse("/");
-        boolean rWaitDefault = runContext.render(this.wait).as(Boolean.class).orElse(false);
-        long rMaxRequestSize = runContext.render(this.maxRequestSize).as(Long.class).orElse(10L * 1024 * 1024);
-        FetchType rFetchTypeDefault = runContext.render(this.fetchType).as(FetchType.class).orElse(FetchType.FETCH);
-        List<CompiledRoute> compiledRoutes = compileRoutes(runContext, rBasePath, rWaitDefault, rFetchTypeDefault);
+        int rPort = startup.render("port", () -> runContext.render(this.port).as(Integer.class).orElse(8080));
+        String rHost = startup.render("host", () -> runContext.render(this.host).as(String.class).orElse("0.0.0.0"));
+        String rBasePath = startup.render("basePath", () -> runContext.render(this.basePath).as(String.class).orElse("/"));
+        boolean rWaitDefault = startup.render("wait", () -> runContext.render(this.wait).as(Boolean.class).orElse(false));
+        long rMaxRequestSize = startup.render("maxRequestSize", () -> runContext.render(this.maxRequestSize).as(Long.class).orElse(10L * 1024 * 1024));
+        FetchType rFetchTypeDefault = startup.render("fetchType", () -> runContext.render(this.fetchType).as(FetchType.class).orElse(FetchType.FETCH));
+        List<CompiledRoute> compiledRoutes = compileRoutes(runContext, startup, rBasePath, rWaitDefault, rFetchTypeDefault);
 
         // Resolved before the server starts: every route can receive an upload, and an instance that cannot store
         // one should fail the trigger rather than a caller's request halfway through.
-        RequestStorage storage = RequestStorage.of(runContext, triggerContext);
+        RequestStorage storage = startup.render("storage", () -> RequestStorage.of(runContext, triggerContext));
 
         // The gate accepts any of apiKey plus every apiKeys entry; the matched key still reaches the flow.
         List<String> validKeys = new ArrayList<>();
-        runContext.render(this.apiKey).as(String.class).filter(k -> !k.isEmpty()).ifPresent(validKeys::add);
+        startup.render("apiKey", () -> runContext.render(this.apiKey).as(String.class).filter(k -> !k.isEmpty()))
+            .ifPresent(validKeys::add);
         if (this.apiKeys != null) {
-            for (String key : runContext.render(this.apiKeys).asList(String.class)) {
+            for (String key : startup.render("apiKeys", () -> runContext.render(this.apiKeys).asList(String.class))) {
                 if (key != null && !key.isEmpty()) {
                     validKeys.add(key);
                 }
@@ -449,25 +451,30 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         // Each accepted pair is reduced to a digest of "user:password", the exact byte sequence a Basic header
         // decodes to, so a request is checked with one constant-time comparison per credential.
         List<byte[]> basicDigests = new ArrayList<>();
-        for (BasicCredential credential : ListUtils.emptyOnNull(this.basicAuth)) {
-            String user = runContext.render(credential.getUsername()).as(String.class).orElse(null);
-            String password = runContext.render(credential.getPassword()).as(String.class).orElse(null);
+        List<BasicCredential> credentials = ListUtils.emptyOnNull(this.basicAuth);
+        for (int index = 0; index < credentials.size(); index++) {
+            BasicCredential credential = credentials.get(index);
 
-            if (user == null || user.isEmpty() || password == null) {
-                throw new IllegalArgumentException("A 'basicAuth' entry needs a non-empty username and a password");
-            }
+            basicDigests.add(startup.render("basicAuth[" + index + "]", () -> {
+                String user = runContext.render(credential.getUsername()).as(String.class).orElse(null);
+                String password = runContext.render(credential.getPassword()).as(String.class).orElse(null);
 
-            basicDigests.add(sha256(user + ":" + password));
+                if (user == null || user.isEmpty() || password == null) {
+                    throw new IllegalArgumentException("A 'basicAuth' entry needs a non-empty username and a password");
+                }
+
+                return sha256(user + ":" + password);
+            }));
         }
 
         HandlerConfig config = new HandlerConfig(
-            runContext.render(this.authHeader).as(String.class).orElse("X-Api-Key"),
+            startup.render("authHeader", () -> runContext.render(this.authHeader).as(String.class).orElse("X-Api-Key")),
             List.copyOf(validKeys),
             List.copyOf(basicDigests),
-            runContext.render(this.invalidCredentialsStatus).as(Integer.class).orElse(401),
-            runContext.render(this.authFailureBody).as(String.class).orElse(null),
-            runContext.render(this.responseOutput).as(String.class).orElse("response"),
-            runContext.render(this.waitTimeout).as(Duration.class).orElse(Duration.ofSeconds(30))
+            startup.render("invalidCredentialsStatus", () -> runContext.render(this.invalidCredentialsStatus).as(Integer.class).orElse(401)),
+            startup.render("authFailureBody", () -> runContext.render(this.authFailureBody).as(String.class).orElse(null)),
+            startup.render("responseOutput", () -> runContext.render(this.responseOutput).as(String.class).orElse("response")),
+            startup.render("waitTimeout", () -> runContext.render(this.waitTimeout).as(Duration.class).orElse(Duration.ofSeconds(30)))
         );
 
         boolean anyWait = compiledRoutes.stream().anyMatch(CompiledRoute::synchronous);
@@ -991,29 +998,34 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
 
     private List<CompiledRoute> compileRoutes(
         RunContext runContext,
+        StartupProperties startup,
         String basePath,
         boolean waitDefault,
         FetchType fetchTypeDefault
     ) throws Exception {
         List<CompiledRoute> compiled = new ArrayList<>(routes.size());
 
-        for (RouteDefinition route : routes) {
-            String rawMethod = runContext.render(route.getMethod()).as(String.class)
-                .orElseThrow(() -> new IllegalArgumentException("Route method is mandatory"));
-            String rawPath = runContext.render(route.getPath()).as(String.class)
-                .orElseThrow(() -> new IllegalArgumentException("Route path is mandatory"));
+        for (int index = 0; index < routes.size(); index++) {
+            RouteDefinition route = routes.get(index);
 
-            HandlerType method = handlerType(rawMethod);
+            compiled.add(startup.render("routes[" + index + "]", () -> {
+                String rawMethod = runContext.render(route.getMethod()).as(String.class)
+                    .orElseThrow(() -> new IllegalArgumentException("Route method is mandatory"));
+                String rawPath = runContext.render(route.getPath()).as(String.class)
+                    .orElseThrow(() -> new IllegalArgumentException("Route path is mandatory"));
 
-            compiled.add(new CompiledRoute(
-                method,
-                normalizePath(basePath, rawPath),
-                runContext.render(route.getConsumes()).as(String.class).orElse(null),
-                runContext.render(route.getProduces()).as(String.class).orElse("application/json"),
-                runContext.render(route.getWait()).as(Boolean.class).orElse(waitDefault),
-                runContext.render(route.getFetchType()).as(FetchType.class).orElse(fetchTypeDefault),
-                runContext.render(route.getBase64Body()).as(Boolean.class).orElse(false)
-            ));
+                HandlerType method = handlerType(rawMethod);
+
+                return new CompiledRoute(
+                    method,
+                    normalizePath(basePath, rawPath),
+                    runContext.render(route.getConsumes()).as(String.class).orElse(null),
+                    runContext.render(route.getProduces()).as(String.class).orElse("application/json"),
+                    runContext.render(route.getWait()).as(Boolean.class).orElse(waitDefault),
+                    runContext.render(route.getFetchType()).as(FetchType.class).orElse(fetchTypeDefault),
+                    runContext.render(route.getBase64Body()).as(Boolean.class).orElse(false)
+                );
+            }));
         }
 
         return compiled;
@@ -1117,6 +1129,39 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
      */
     private record CompiledRoute(HandlerType method, String fullPath, String consumes, String produces,
                                  boolean synchronous, FetchType fetchType, boolean base64Body) {
+    }
+
+    /**
+     * Resolves the startup configuration, naming whichever property fails.
+     * <p>
+     * Configuration is resolved before the server binds, so anything unresolvable here — an unresolved
+     * {@code secret()} being by far the most common — stops the trigger with nothing listening on the port. Kestra
+     * reports that failure itself, but the message it carries names the missing variable rather than the property
+     * that referenced it, and there is no request to attribute it to. Saying which property could not be rendered
+     * is what makes the failure actionable from the log alone.
+     */
+    record StartupProperties(Logger logger, String triggerId) {
+
+        <T> T render(String property, StartupProperty<T> value) throws Exception {
+            try {
+                return value.render();
+            } catch (Exception e) {
+                logger.error(
+                    "REST server trigger '{}' cannot start: property '{}' could not be resolved: {}",
+                    triggerId, property, e.getMessage(), e
+                );
+
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * One property of the startup configuration, as resolved by {@link StartupProperties#render}.
+     */
+    @FunctionalInterface
+    interface StartupProperty<T> {
+        T render() throws Exception;
     }
 
     /**
