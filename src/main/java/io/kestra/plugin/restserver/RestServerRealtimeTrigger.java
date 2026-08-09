@@ -1232,7 +1232,8 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             // Two caveats upstream is explicit about: Services is not part of the official plugin API and may
             // change without notice, and additionalService() throws inside the Worker. The latter is why the
             // catch below reads the way it does — on a dedicated Worker the bean would not exist anyway, since
-            // ExecutionStreamingService needs the execution repository. Tracked upstream: TODO(issue).
+            // ExecutionStreamingService needs the execution repository.
+            // Tracked upstream: https://github.com/kestra-io/kestra/issues/17991
             try {
                 return new ExecutionAwaiter(
                     defaultRunContext.services().additionalService(ExecutionStreamingService.class)
