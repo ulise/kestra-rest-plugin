@@ -26,7 +26,6 @@ import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.services.ExecutionStreamingService;
 import io.kestra.core.utils.IdUtils;
 import io.kestra.core.utils.ListUtils;
-import io.micronaut.context.ApplicationContext;
 import io.micronaut.http.sse.Event;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotEmpty;
@@ -44,7 +43,6 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 
-import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -1227,34 +1225,23 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
                 );
             }
 
-            return new ExecutionAwaiter(applicationContextOf(defaultRunContext).getBean(ExecutionStreamingService.class));
-        }
-
-        /**
-         * STOPGAP. Kestra 1.x let a plugin reach beans through {@code DefaultRunContext#getApplicationContext()};
-         * 2.0 removed that accessor without offering a plugin-facing replacement for anything but the internal
-         * storage ({@link io.kestra.core.contexts.KestraContext}). Sync mode needs {@link ExecutionStreamingService},
-         * so read the field it still holds.
-         * <p>
-         * This is the one place in the plugin that touches Kestra internals, deliberately, so that restoring a
-         * supported lookup is a one-method change once upstream exposes one. Tracked upstream: TODO(issue).
-         */
-        private static ApplicationContext applicationContextOf(DefaultRunContext runContext) {
+            // Kestra 1.x let a plugin reach beans through DefaultRunContext#getApplicationContext(); 2.0 removed
+            // that in favour of Services, a curated facade, with additionalService() as the escape hatch for
+            // everything it does not name. ExecutionStreamingService is not named, so it goes through the hatch.
+            //
+            // Two caveats upstream is explicit about: Services is not part of the official plugin API and may
+            // change without notice, and additionalService() throws inside the Worker. The latter is why the
+            // catch below reads the way it does — on a dedicated Worker the bean would not exist anyway, since
+            // ExecutionStreamingService needs the execution repository. Tracked upstream: TODO(issue).
             try {
-                Field field = DefaultRunContext.class.getDeclaredField("applicationContext");
-                field.setAccessible(true);
-
-                ApplicationContext applicationContext = (ApplicationContext) field.get(runContext);
-                if (applicationContext == null) {
-                    throw new IllegalStateException("the run context has no application context yet");
-                }
-
-                return applicationContext;
-            } catch (ReflectiveOperationException | RuntimeException e) {
+                return new ExecutionAwaiter(
+                    defaultRunContext.services().additionalService(ExecutionStreamingService.class)
+                );
+            } catch (RuntimeException e) {
                 throw new IllegalStateException(
-                    "Synchronous 'wait' mode could not reach the Kestra application context. This plugin reads a "
-                        + "private field of DefaultRunContext because Kestra 2.0 exposes no supported alternative; "
-                        + "a core change may have broken it. Use asynchronous routes until the plugin is updated.",
+                    "Synchronous 'wait' mode could not reach Kestra's execution streaming service. It is available "
+                        + "on a standalone server and on the Scheduler, but not inside a dedicated Worker. Use "
+                        + "asynchronous routes there, or run the trigger on a server that carries the Executor.",
                     e
                 );
             }
