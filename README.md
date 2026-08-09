@@ -9,7 +9,8 @@ execution with the request data exposed as `{{ trigger.* }}` variables.
 
 - **Coordinates:** `io.kestra.plugin:plugin-rest-server`
 - **Package:** `io.kestra.plugin.restserver`
-- **Requires:** Java 21+, Kestra 1.3.x
+- **Requires:** Java 21+, Kestra 1.3.x — **or** Java 25+ and Kestra 2.0.x on the `feat/kestra-2.0`
+  branch, which is not yet released (see [Kestra 2.0](#kestra-20))
 
 ## Compatibility
 
@@ -35,9 +36,51 @@ your instance; the plugin embeds Javalin on a Jetty aligned to that Kestra's Jet
 published artifact rather than a local build: a multipart file part and a `fetchType: STORE` body both read
 back **byte-identical** from the internal storage and were consumed by `io.kestra.plugin.core.storage.Size`.
 
+Every row above targets the Kestra 1.3.x line. Kestra 2.0 support lives on an unreleased branch — see
+[Kestra 2.0](#kestra-20) below.
+
 To build against a different Kestra version, set `kestraVersion` in `gradle.properties` and, if that
 version ships a different Jetty, realign `javalinVersion`/`jettyVersion` as described in the notes below.
 When cutting a new release, add a row here for the versions it was built against.
+
+### Kestra 2.0
+
+The `feat/kestra-2.0` branch builds and passes its full suite against Kestra 2.0. **It is not released,
+and it is not end-to-end verified against a running 2.0 instance** — only the test suite has been run.
+There is no plugin release that works on both lines: 2.0 needs Java 25 and changes APIs the plugin uses,
+so a 1.3.x build will not load on 2.0.
+
+| Branch            | Kestra           | Javalin | Jetty     | Java |
+|-------------------|------------------|---------|-----------|------|
+| `feat/kestra-2.0` | `2.0.0-SNAPSHOT` | `7.2.2` | `12.1.10` | 25+  |
+
+**It targets `2.0.0-SNAPSHOT`, not an RC tag, and that is deliberate.** The `v2.0.0-rcN` tags exist in
+Kestra's git and as Docker images, but **the RC artifacts are not published to Maven Central** —
+`io/kestra/platform/2.0.0-rc7` is a 404, and Central's metadata for the platform BOM stops at `1.3.31`.
+The only consumable 2.0 artifacts are `2.0.0-SNAPSHOT` on the Sonatype snapshot repository, rebuilt
+daily from `develop`. Pinning an RC would mean building Kestra from source and publishing to
+`mavenLocal` on every bump. `build.gradle` adds the snapshot repository whenever `kestraVersion` ends
+in `-SNAPSHOT`. Pin a real version once 2.0.0 GA is on Central.
+
+Because the target is a daily snapshot, a build that worked yesterday can break today. That is the cost
+of the only available option, not a defect.
+
+What 2.0 changed for this plugin:
+
+- **Java 25 is required.** Kestra 2.0's class files cannot be read by an older `javac`.
+- **Queues moved** into a new `io.kestra:queue` module, and the execution queue became a
+  competing-consumer `DispatchQueueInterface`. See
+  [Synchronous mode](#synchronous-mode-and-flow-controlled-responses) for what that changed.
+- **`DefaultRunContext#getApplicationContext` is gone.** Internal storage now comes from
+  `KestraContext.getContext().getStorageInterface()`.
+- **Realtime triggers implement `eval`, not `evaluate`**, emitting the lightweight
+  `TriggerEvaluationResult` instead of a full `Execution`.
+- **Allure is no longer pinned** by Kestra's platform BOM, so `gradle.properties` pins it here.
+
+Javalin and Jetty are unaffected: Kestra's platform BOM pins Jetty `12.0.31` on **both** 1.3.31 and
+2.0.0-rc7, so the override described in
+[Javalin 7 instead of 6, and a pinned Jetty](#javalin-7-instead-of-6-and-a-pinned-jetty) applies
+unchanged.
 
 ### Upgrading to 1.4.0
 
@@ -288,9 +331,26 @@ the execution does not finish within `waitTimeout`, the request returns `504` (t
 
 Synchronous mode requires the trigger's worker and the executor to share a JVM — the case for
 `kestra server local`, `kestra server standalone`, and a single-replica Helm `standalone` deployment. It is
-**queue-backend agnostic**: the trigger subscribes to the execution queue through Kestra's `QueueInterface`,
-so the memory, H2, MySQL and Postgres queues all work. Verified on both H2 (`server local`) and postgres
-(`server standalone`) — see [Testing against postgres](#testing-against-postgres).
+**queue-backend agnostic**, so the memory, H2, MySQL and Postgres queues all work. Verified on both H2
+(`server local`) and postgres (`server standalone`) — see
+[Testing against postgres](#testing-against-postgres).
+
+How it observes the execution differs by Kestra line:
+
+- **On 1.3.x**, the trigger subscribes to the execution queue through Kestra's `QueueInterface` and reads
+  it without consuming.
+- **On 2.0**, that is no longer possible or correct: the execution queue became a competing-consumer
+  `DispatchQueueInterface`, so a plugin subscribing to it would **steal messages from the Executor**. The
+  trigger instead uses core's `ExecutionStreamingService` — the same mechanism behind the webserver's own
+  `?wait=true` endpoint.
+
+> **On 2.0, synchronous mode does not work under a dedicated `kestra server worker`.** Reaching
+> `ExecutionStreamingService` goes through `Services#additionalService`, which throws by design inside a
+> Worker, and Kestra 2.0 exposes no supported alternative. A route with `wait: true` fails there with an
+> explanatory error; asynchronous routes are unaffected. This is a gap in the 2.0 plugin API rather than a
+> design choice here, and it is filed upstream as
+> [kestra-io/kestra#17991](https://github.com/kestra-io/kestra/issues/17991). It costs nothing on the
+> single-JVM deployments synchronous mode already required.
 
 On JDBC backends the queue is polled rather than dispatched in-process, which costs latency on an
 otherwise idle instance: measured against postgres, a request arriving while the poller is hot returns in
@@ -398,7 +458,8 @@ list — which is exactly what the edge checks above avoid.
 The unit tests start the real server on an ephemeral port and drive it over HTTP; they need no Kestra
 instance. Beyond those, the plugin has been verified end-to-end against Kestra 1.3.28 in Docker: the
 plugin loads, the flow above deploys, and `202` / `404` / `415` and the trigger variables all behave as
-documented.
+documented. The [Kestra 2.0](#kestra-20) branch passes the same suite against `2.0.0-SNAPSHOT`, but has
+had no equivalent end-to-end run.
 
 ## Deploy
 
@@ -453,7 +514,10 @@ which is the only feature whose behaviour could plausibly differ per backend. `e
 exercises `wait: true` including the flow-controlled non-2xx path.
 
 The images are pinned to the Kestra version in the [compatibility table](#compatibility) rather than
-`latest`, which currently resolves to a 2.x nightly this plugin is not built against.
+`latest`, which resolves to a 2.x build the released plugin is not compiled against. The
+[Kestra 2.0](#kestra-20) branch is: `kestra/kestra:v2.0.0-rc7` and its siblings are on Docker Hub even
+though the matching Maven artifacts are not. That stack has not been exercised yet — the 2.0 branch is
+verified by its test suite only.
 
 **When bind-mounting the plugins directory into a container, the source must be a path the Docker daemon
 can actually see.** A directory the daemon cannot read (for example under `/tmp` on some setups, or on a
@@ -510,6 +574,11 @@ The spec targets Kestra 0.20, which is several major versions behind. Two APIs c
   plain fields. This is what makes route fields templatable.
 - `TriggerService.generateRealtimeExecution` takes the trigger first, not the trigger context:
   `generateRealtimeExecution(this, conditionContext, triggerContext, output)`.
+
+On the [Kestra 2.0](#kestra-20) branch both have moved on again: the trigger implements `eval` rather
+than the deprecated `evaluate`, and emits a `TriggerEvaluationResult` built the way
+`TriggerService.generateRealtimeEvaluationResult` builds one. The plugin mints the execution id itself in
+either case, because a request's files are stored under that id before the output describing them exists.
 
 Set `kestraVersion` in `gradle.properties` to match your instance.
 
