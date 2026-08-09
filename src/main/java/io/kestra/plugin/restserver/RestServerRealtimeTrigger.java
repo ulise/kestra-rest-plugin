@@ -18,6 +18,7 @@ import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.AbstractTrigger;
 import io.kestra.core.models.triggers.RealtimeTriggerInterface;
 import io.kestra.core.models.triggers.TriggerContext;
+import io.kestra.core.models.triggers.TriggerEvaluationResult;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
 import io.kestra.core.runners.DefaultRunContext;
@@ -417,7 +418,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     private final CountDownLatch waitForTermination = new CountDownLatch(1);
 
     @Override
-    public Publisher<Execution> evaluate(ConditionContext conditionContext, TriggerContext triggerContext) throws Exception {
+    public Publisher<TriggerEvaluationResult> eval(ConditionContext conditionContext, TriggerContext triggerContext) throws Exception {
         RunContext runContext = conditionContext.getRunContext();
         Logger logger = runContext.logger();
         StartupProperties startup = new StartupProperties(logger, triggerContext.getTriggerId());
@@ -546,7 +547,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         CompiledRoute route,
         ConditionContext conditionContext,
         TriggerContext triggerContext,
-        FluxSink<Execution> emitter,
+        FluxSink<TriggerEvaluationResult> emitter,
         HandlerConfig config,
         ExecutionAwaiter awaiter,
         RequestStorage storage
@@ -600,7 +601,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         // execution it is about to create, and is purged with it.
         String executionId = IdUtils.create();
         boolean anythingStored = false;
-        Execution execution;
+        TriggerEvaluationResult evaluation;
 
         try {
             if (ctx.isMultipartFormData()) {
@@ -631,7 +632,7 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             Output output = builder.build();
 
             // Built here rather than in a downstream map() so the caller can be told which execution it started.
-            execution = generateExecution(executionId, output, conditionContext, triggerContext);
+            evaluation = generateEvaluationResult(executionId, output, conditionContext);
         } catch (Exception e) {
             // Nothing will ever purge what was stored, since the execution it is scoped to will not exist.
             if (anythingStored) {
@@ -645,30 +646,30 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
         }
 
         if (!route.synchronous()) {
-            emitter.next(execution);
+            emitter.next(evaluation);
             ctx.status(202)
                 .contentType(route.produces())
                 .result(json(Map.of(
                     "status", "accepted",
-                    "executionId", execution.getId()
+                    "executionId", evaluation.executionId()
                 )));
             return;
         }
 
         // Synchronous mode: register interest before emitting, so a fast completion cannot be missed.
-        CompletableFuture<Execution> completion = awaiter.register(execution.getId(), flowOf(conditionContext));
-        emitter.next(execution);
+        CompletableFuture<Execution> completion = awaiter.register(evaluation.executionId(), flowOf(conditionContext));
+        emitter.next(evaluation);
 
         try {
             Execution terminal = completion.get(config.waitTimeout().toMillis(), TimeUnit.MILLISECONDS);
             applyResponse(ctx, mapResponse(terminal, config.responseOutput(), route.produces()));
         } catch (TimeoutException e) {
-            awaiter.cancel(execution.getId());
+            awaiter.cancel(evaluation.executionId());
             ctx.status(504)
                 .contentType("application/json")
-                .result(json(Map.of("status", "timeout", "executionId", execution.getId())));
+                .result(json(Map.of("status", "timeout", "executionId", evaluation.executionId())));
         } catch (Exception e) {
-            awaiter.cancel(execution.getId());
+            awaiter.cancel(evaluation.executionId());
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -942,17 +943,20 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
     }
 
     /**
-     * Builds the execution a request starts, with an id chosen by the caller of this method.
+     * Builds the evaluation result a request produces, with an id chosen by the caller of this method.
      * <p>
-     * This mirrors {@link TriggerService#generateRealtimeExecution}, which cannot be used here because it mints the
-     * id itself: the files a request brings with it have to be stored before the output describing them exists, and
-     * they are stored under the execution id, so that id has to be known first.
+     * This mirrors {@link TriggerService#generateRealtimeEvaluationResult}, which cannot be used here because it
+     * mints the id itself: the files a request brings with it have to be stored before the output describing them
+     * exists, and they are stored under the execution id, so that id has to be known first.
+     * <p>
+     * Kestra 2.0 has the scheduler rebuild the full execution from this, via
+     * {@link TriggerEvaluationResult#toExecution}. Namespace, flow id, and tenant now come from the trigger id on
+     * that side, and flow variables are resolved from the flow, so neither is set here any more.
      */
-    private Execution generateExecution(
+    private TriggerEvaluationResult generateEvaluationResult(
         String id,
         Output output,
-        ConditionContext conditionContext,
-        TriggerContext triggerContext
+        ConditionContext conditionContext
     ) {
         ExecutionTrigger executionTrigger = ExecutionTrigger.of(this, output, conditionContext.getRunContext().logFileURI());
 
@@ -962,17 +966,15 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             labels.add(new Label(Label.CORRELATION_ID, id));
         }
 
-        return Execution.builder()
-            .id(id)
-            .namespace(triggerContext.getNamespace())
-            .flowId(triggerContext.getFlowId())
-            .tenantId(triggerContext.getTenantId())
-            .flowRevision(conditionContext.getFlow().getRevision())
-            .variables(conditionContext.getFlow().getVariables())
-            .state(new State())
-            .trigger(executionTrigger)
-            .labels(labels)
-            .build();
+        return new TriggerEvaluationResult(
+            id,
+            State.Type.CREATED,
+            executionTrigger,
+            labels,
+            conditionContext.getFlow().getRevision(),
+            null,
+            null
+        );
     }
 
     private boolean matchesConsumes(Context ctx, CompiledRoute route) {

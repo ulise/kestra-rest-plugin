@@ -20,7 +20,7 @@ import java.net.URISyntaxException;
  * Storing under the execution is what makes the files someone else's problem to clean up: they are purged with the
  * execution, exactly like a task's output files. It also means the execution id has to exist before a single byte is
  * read, which is why {@link RestServerRealtimeTrigger} mints it up front instead of letting
- * {@code TriggerService.generateRealtimeExecution} do it.
+ * {@code TriggerService.generateRealtimeEvaluationResult} do it.
  */
 class RequestStorage {
 

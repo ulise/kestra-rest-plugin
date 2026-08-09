@@ -12,6 +12,8 @@ import io.kestra.core.runners.ExecutionEventType;
 import io.kestra.core.queues.BroadcastQueueInterface;
 import io.kestra.core.repositories.ExecutionRepositoryInterface;
 import io.kestra.core.runners.FollowExecutionEvent;
+import io.kestra.core.models.triggers.TriggerContext;
+import io.kestra.core.models.triggers.TriggerEvaluationResult;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.scheduler.model.TriggerState;
 import io.kestra.core.storages.StorageContext;
@@ -227,7 +229,7 @@ class RestServerRealtimeTriggerTest {
 
         IllegalArgumentException exception = assertThrows(
             IllegalArgumentException.class,
-            () -> trigger.evaluate(mock.getKey(), mock.getValue().context())
+            () -> trigger.eval(mock.getKey(), mock.getValue().context())
         );
         assertThat(exception.getMessage(), containsString("Unsupported HTTP method"));
     }
@@ -247,7 +249,7 @@ class RestServerRealtimeTriggerTest {
 
         Map.Entry<ConditionContext, TriggerState> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
 
-        assertThrows(Exception.class, () -> trigger.evaluate(mock.getKey(), mock.getValue().context()));
+        assertThrows(Exception.class, () -> trigger.eval(mock.getKey(), mock.getValue().context()));
 
         // Nothing bound the port, so the failure is total rather than a server answering without authentication.
         assertThrows(ConnectException.class, () -> CLIENT.send(
@@ -1135,12 +1137,18 @@ class RestServerRealtimeTriggerTest {
     }
 
     /**
-     * {@code evaluate()} blocks its thread for the lifetime of the server, so it has to run off the test thread.
+     * {@code eval()} blocks its thread for the lifetime of the server, so it has to run off the test thread.
+     * <p>
+     * The trigger emits the lightweight {@link TriggerEvaluationResult} that Kestra 2.0 expects. Rebuilding the
+     * full execution from it here is exactly what the scheduler does on receipt, so the assertions below keep
+     * working on an {@code Execution} and the round-trip gets covered on the way.
      */
     private Disposable subscribe(RestServerRealtimeTrigger trigger, List<Execution> executions) throws Exception {
         Map.Entry<ConditionContext, TriggerState> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
+        TriggerContext triggerContext = mock.getValue().context();
 
-        return Flux.from(trigger.evaluate(mock.getKey(), mock.getValue().context()))
+        return Flux.from(trigger.eval(mock.getKey(), triggerContext))
+            .map(result -> result.toExecution(triggerContext))
             .subscribeOn(Schedulers.boundedElastic())
             .subscribe(executions::add);
     }
