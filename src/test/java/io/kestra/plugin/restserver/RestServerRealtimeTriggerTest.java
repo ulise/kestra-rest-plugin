@@ -1,5 +1,8 @@
 package io.kestra.plugin.restserver;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
@@ -15,6 +18,7 @@ import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
@@ -221,6 +225,66 @@ class RestServerRealtimeTriggerTest {
             () -> trigger.evaluate(mock.getKey(), mock.getValue())
         );
         assertThat(exception.getMessage(), containsString("Unsupported HTTP method"));
+    }
+
+    @Test
+    void unresolvableStartupPropertyFailsTheTriggerBeforeTheServerStarts() throws Exception {
+        int port = freePort();
+        RestServerRealtimeTrigger trigger = RestServerRealtimeTrigger.builder()
+            .id("rest_server")
+            .type(RestServerRealtimeTrigger.class.getName())
+            .port(Property.ofValue(port))
+            .basePath(Property.ofValue("/api"))
+            // Stands in for the case that motivated this: a `secret()` that does not resolve.
+            .apiKey(Property.ofExpression("{{ thereIsNoSuchVariable }}"))
+            .routes(List.of(route("GET", "/orders", null, null)))
+            .build();
+
+        Map.Entry<ConditionContext, Trigger> mock = TestsUtils.mockTrigger(runContextFactory, trigger);
+
+        assertThrows(Exception.class, () -> trigger.evaluate(mock.getKey(), mock.getValue()));
+
+        // Nothing bound the port, so the failure is total rather than a server answering without authentication.
+        assertThrows(ConnectException.class, () -> CLIENT.send(
+            request(port, "/api/orders").GET().build(),
+            HttpResponse.BodyHandlers.ofString()
+        ));
+    }
+
+    @Test
+    void startupPropertyFailureIsLoggedWithItsNameAndRethrown() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("startup-properties-test");
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+
+        RestServerRealtimeTrigger.StartupProperties startup =
+            new RestServerRealtimeTrigger.StartupProperties(logger, "rest");
+
+        try {
+            IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> startup.render(
+                "basicAuth[1]",
+                () -> {
+                    throw new IllegalStateException("Missing variable: 'SECRET_SAP_INBOUND_PASSWORD'");
+                }
+            ));
+
+            // The exception reaches Kestra untouched: it is what fails the trigger.
+            assertThat(thrown.getMessage(), is("Missing variable: 'SECRET_SAP_INBOUND_PASSWORD'"));
+
+            assertThat(appender.list, hasSize(1));
+            ILoggingEvent logged = appender.list.getFirst();
+            assertThat(logged.getLevel(), is(Level.ERROR));
+            // Which trigger, which property, and what the underlying failure was.
+            assertThat(logged.getFormattedMessage(), allOf(
+                containsString("'rest'"),
+                containsString("'basicAuth[1]'"),
+                containsString("Missing variable: 'SECRET_SAP_INBOUND_PASSWORD'")
+            ));
+        } finally {
+            logger.detachAppender(appender);
+        }
     }
 
     @Test

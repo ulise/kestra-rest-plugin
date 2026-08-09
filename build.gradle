@@ -114,6 +114,8 @@ dependencies {
     testImplementation 'org.hamcrest:hamcrest'
     testImplementation 'org.hamcrest:hamcrest-library'
     testImplementation 'org.awaitility:awaitility'
+    // Already the logging backend at test runtime; declared so a test can capture what the trigger logs.
+    testImplementation 'ch.qos.logback:logback-classic'
 }
 
 /**********************************************************************************************************************\

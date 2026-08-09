@@ -475,6 +475,27 @@ keep the port on an internal network or behind a reverse proxy that terminates T
 **Route changes take effect on trigger restart.** Routes are rendered and registered once, when the
 server starts.
 
+**Referenced secrets must exist before the flow is first evaluated.** Every property — `apiKey`, `apiKeys`,
+`basicAuth`, the port, the routes — is rendered once, before the port is bound, so a `secret()` that does not
+resolve stops the trigger with nothing listening and callers seeing connection failures. It is reported, but not
+where you are likely to look first: the plugin logs which property could not be resolved, and Kestra creates a
+**FAILED execution** for the flow carrying "Realtime trigger failed to be created in the worker". Both go to the
+flow's logs rather than to the pod's stdout as a plugin message. Create the secrets before deploying the flow.
+
+**Recovering a trigger that failed to start needs an unlock, not a restart** (Kestra 1.3.x). The scheduler marks a
+realtime trigger as running when it hands it to a worker, and on 1.3.x nothing clears that mark when the trigger
+ends. A trigger that failed to start is therefore never re-evaluated — it reports as healthy while the port stays
+closed. Fix the underlying cause, then release it with:
+
+```bash
+curl -X POST -u '<user>:<password>' \
+  'http://<kestra>/api/v1/<tenant>/triggers/<namespace>/<flowId>/<triggerId>/unlock'
+```
+
+Restarting the Kestra process also clears it — on JDBC backends every evaluation lock is wiped at scheduler
+startup — which is why a restart sometimes appears to fix it and sometimes does not. The 2.0 line releases the
+lock on its own when a realtime trigger fails to start.
+
 ## Notes on this implementation
 
 This plugin follows `kestra-rest-server-plugin-spec.md`, with three deviations that the spec's own
