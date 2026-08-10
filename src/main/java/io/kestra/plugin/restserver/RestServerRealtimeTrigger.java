@@ -1231,11 +1231,18 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
             // that in favour of Services, a curated facade, with additionalService() as the escape hatch for
             // everything it does not name. ExecutionStreamingService is not named, so it goes through the hatch.
             //
-            // Two caveats upstream is explicit about: Services is not part of the official plugin API and may
-            // change without notice, and additionalService() throws inside the Worker. The latter is why the
-            // catch below reads the way it does — on a dedicated Worker the bean would not exist anyway, since
-            // ExecutionStreamingService needs the execution repository.
-            // Tracked upstream: https://github.com/kestra-io/kestra/issues/17991
+            // INTERIM. kestra-io/kestra#17991 was answered and closed: in 2.0 the Worker reaches Kestra over
+            // gRPC, and a separately started Worker has no repository beans at all, by design. That this works
+            // on a standalone server is "a side-effect of standalone deployment where all components are
+            // deployed inside the same JVM" — incidental, not a contract, and additionalService() is reserved
+            // for privileged tasks inside the Executor.
+            //
+            // The sanctioned replacement is to call Kestra's own API:
+            // kestra-api-client's executions().followExecution(tenant, id) returns a Flux<Execution> over the
+            // SSE endpoint. Not adopted yet — it makes credentials and worker->webserver reachability
+            // mandatory for sync mode, and kestra-api-client has no 2.0-aligned release (Central stops at
+            // 1.3.2). Until then this keeps working on server local / server standalone and fails loudly
+            // elsewhere, which is the honest behaviour.
             try {
                 return new ExecutionAwaiter(
                     defaultRunContext.services().additionalService(ExecutionStreamingService.class)

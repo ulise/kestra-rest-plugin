@@ -329,10 +329,11 @@ carry different bodies (e.g. `{"status":"NOT_FOUND"}` vs `{"status":"NO_RECEIPT"
 absent, a successful execution returns `200` with its outputs as JSON and a failed one returns `500`. If
 the execution does not finish within `waitTimeout`, the request returns `504` (the execution keeps running).
 
-Synchronous mode requires the trigger's worker and the executor to share a JVM — the case for
-`kestra server local`, `kestra server standalone`, and a single-replica Helm `standalone` deployment. It is
-**queue-backend agnostic**, so the memory, H2, MySQL and Postgres queues all work. Verified on both H2
-(`server local`) and postgres (`server standalone`) — see
+Synchronous mode currently requires the trigger's worker and the executor to share a JVM — the case for
+`kestra server local`, `kestra server standalone`, and a single-replica Helm `standalone` deployment. On
+1.3.x that is simply how it works; on 2.0 it is co-location Kestra treats as incidental, so read the
+callout below before depending on it. It is **queue-backend agnostic**, so the memory, H2, MySQL and
+Postgres queues all work. Verified on both H2 (`server local`) and postgres (`server standalone`) — see
 [Testing against postgres](#testing-against-postgres).
 
 How it observes the execution differs by Kestra line:
@@ -344,13 +345,24 @@ How it observes the execution differs by Kestra line:
   trigger instead uses core's `ExecutionStreamingService` — the same mechanism behind the webserver's own
   `?wait=true` endpoint.
 
-> **On 2.0, synchronous mode does not work under a dedicated `kestra server worker`.** Reaching
-> `ExecutionStreamingService` goes through `Services#additionalService`, which throws by design inside a
-> Worker, and Kestra 2.0 exposes no supported alternative. A route with `wait: true` fails there with an
-> explanatory error; asynchronous routes are unaffected. This is a gap in the 2.0 plugin API rather than a
-> design choice here, and it is filed upstream as
-> [kestra-io/kestra#17991](https://github.com/kestra-io/kestra/issues/17991). It costs nothing on the
-> single-JVM deployments synchronous mode already required.
+> **On 2.0 the current implementation relies on co-location that Kestra does not sanction, and it will be
+> replaced.** Asked upstream in
+> [kestra-io/kestra#17991](https://github.com/kestra-io/kestra/issues/17991), Kestra's answer was that in
+> 2.0 the Worker reaches Kestra over gRPC and a separately started Worker has **no repository beans at
+> all** — by design. That the trigger can reach `ExecutionStreamingService` on `server standalone` is "a
+> side-effect of standalone deployment where all components are deployed inside the same JVM", not a
+> supported contract, so it may stop working without notice. `Services#additionalService` is reserved for
+> privileged tasks inside the Executor, and realtime triggers are not intended to run there.
+>
+> Practically, today: `wait: true` works on `server local` and `server standalone`, and fails with an
+> explanatory error under a dedicated `kestra server worker`. Asynchronous routes are unaffected on every
+> deployment.
+>
+> The sanctioned replacement is to call Kestra's own API from the trigger, via
+> [`kestra-api-client`](https://github.com/kestra-io/plugin-kestra) —
+> `executions().followExecution(tenant, executionId)` returns a `Flux<Execution>` over the same SSE
+> endpoint the UI follows. That migration is planned but not done; it will make credentials and
+> worker→webserver reachability a **requirement** for synchronous mode, which today needs neither.
 
 On JDBC backends the queue is polled rather than dispatched in-process, which costs latency on an
 otherwise idle instance: measured against postgres, a request arriving while the poller is hot returns in
