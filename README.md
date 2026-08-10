@@ -43,6 +43,31 @@ To build against a different Kestra version, set `kestraVersion` in `gradle.prop
 version ships a different Jetty, realign `javalinVersion`/`jettyVersion` as described in the notes below.
 When cutting a new release, add a row here for the versions it was built against.
 
+### Versioning
+
+**The plugin's major mirrors Kestra's major.**
+
+| Plugin | Kestra  | Java |
+|--------|---------|------|
+| `1.x`  | `1.3.x` | 21+  |
+| `2.x`  | `2.0.x` | 25+  |
+
+Both lines publish to the same coordinate, `io.kestra.plugin:plugin-rest-server`, so the major is the
+only thing that tells a reader which Kestra a given version is for — **always install an explicit
+version rather than the newest one available**, or you may resolve across the line boundary.
+
+This differs from Kestra's own plugins, which use independent semver (`plugin-jdbc` is at `1.15.x`
+while targeting Kestra 1.3.x) and rely on being released in lockstep with the core they ship
+alongside. A third-party plugin has no such release train, so the version number carries the
+information instead.
+
+The trade-off is that a breaking change *within* a Kestra line lands as a minor bump rather than a
+major, because the major is already spoken for. Breaking changes are called out in an "Upgrading to
+…" section — see [Upgrading to 1.4.0](#upgrading-to-140).
+
+**Both lines are maintained.** `main` continues the `1.x` line for Kestra 1.3.x; the 2.0 branch
+carries `2.x`. Fixes that apply to both are landed once and carried across.
+
 ### Kestra 2.0
 
 The `feat/kestra-2.0` branch builds and passes its full suite against Kestra 2.0. **It is not released,
@@ -50,9 +75,12 @@ and it is not end-to-end verified against a running 2.0 instance** — only the 
 There is no plugin release that works on both lines: 2.0 needs Java 25 and changes APIs the plugin uses,
 so a 1.3.x build will not load on 2.0.
 
-| Branch            | Kestra           | Javalin | Jetty     | Java |
-|-------------------|------------------|---------|-----------|------|
-| `feat/kestra-2.0` | `2.0.0-SNAPSHOT` | `7.2.2` | `12.1.10` | 25+  |
+| Branch            | Releases as | Kestra           | Javalin | Jetty     | Java |
+|-------------------|-------------|------------------|---------|-----------|------|
+| `feat/kestra-2.0` | `2.0.0`     | `2.0.0-SNAPSHOT` | `7.2.2` | `12.1.10` | 25+  |
+
+It is versioned `2.0.0-SNAPSHOT` rather than continuing `1.4.x`: it needs Java 25 and will not load on
+Kestra 1.3.x, so it is not a patch. See [Versioning](#versioning).
 
 **It targets `2.0.0-SNAPSHOT`, not an RC tag, and that is deliberate.** The `v2.0.0-rcN` tags exist in
 Kestra's git and as Docker images, but **the RC artifacts are not published to Maven Central** —
