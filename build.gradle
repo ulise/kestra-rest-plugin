@@ -75,6 +75,20 @@ dependencies {
 
     // The embedded HTTP server. Bundled, since Kestra does not provide it.
     implementation "io.javalin:javalin:$javalinVersion"
+
+    // SPIKE (spike/sdk-execution-awaiter): Kestra's own API client, the sanctioned way for a plugin to
+    // reach anything database-backed in 2.0 — see kestra-io/kestra#17991. Bundled; Kestra does not
+    // provide it to plugins. Note Central has no 2.0-aligned release, 1.3.2 is the newest.
+    //
+    // Jackson and Reactor are excluded deliberately: Kestra core puts both on the plugin classpath, and
+    // shading a second copy into this jar invites exactly the version clash the Jetty note in the README
+    // describes. That leaves the generated client plus httpclient5 to bundle.
+    implementation("io.kestra:kestra-api-client:$kestraApiClientVersion") {
+        exclude group: 'com.fasterxml.jackson.core'
+        exclude group: 'com.fasterxml.jackson.datatype'
+        exclude group: 'com.fasterxml.jackson.jaxrs'
+        exclude group: 'io.projectreactor'
+    }
 }
 
 

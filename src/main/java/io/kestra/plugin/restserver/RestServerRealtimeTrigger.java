@@ -833,8 +833,25 @@ public class RestServerRealtimeTrigger extends AbstractTrigger
      */
     @SuppressWarnings("unchecked")
     static ResponseSpec mapResponse(Execution execution, String responseOutputKey, String defaultContentType) throws Exception {
-        Map<String, Object> outputs = execution.getOutputs();
-        boolean success = execution.getState().isTerminatedNoFail();
+        return mapResponse(
+            execution.getOutputs(),
+            execution.getState().isTerminatedNoFail(),
+            responseOutputKey,
+            defaultContentType
+        );
+    }
+
+    /**
+     * The response only ever depended on these two things, not on {@link Execution} itself. Splitting them out
+     * lets a terminal execution obtained from Kestra's API — whose model is a different {@code Execution} type
+     * with {@code Object} outputs — reuse the mapping unchanged. See {@link SdkExecutionAwaiter}.
+     */
+    static ResponseSpec mapResponse(
+        Map<String, Object> outputs,
+        boolean success,
+        String responseOutputKey,
+        String defaultContentType
+    ) throws Exception {
         Object mapped = outputs == null ? null : outputs.get(responseOutputKey);
 
         if (mapped instanceof Map<?, ?> response) {
